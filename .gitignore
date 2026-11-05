@@ -1,0 +1,17 @@
+# Elixir / Phoenix
+/_build/
+/deps/
+/*.ez
+/priv/static/assets/
+/priv/static/index.html
+erl_crash.dump
+
+# Node / Svelte
+/frontend/node_modules/
+/frontend/dist/
+npm-debug.log*
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
