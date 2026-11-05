@@ -9,6 +9,7 @@ defmodule Ukko.Application do
       UkkoWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:ukko, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Ukko.PubSub},
+      Ukko.ZoomTokenCache,
       UkkoWeb.Endpoint
     ]
 
@@ -22,4 +23,3 @@ defmodule Ukko.Application do
     :ok
   end
 end
-
