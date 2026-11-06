@@ -76,6 +76,86 @@
   // App version state
   let appVersion = '0.1.2';
 
+  // Animating ASCII art state for THUNDERCAL
+  const ASCII_THUNDER_BASE = [
+    '▀▀█▀▀ █   █ █   █ █▄  █ ████▄ █████ ████▄ ',
+    '  █   █████ █   █ █ ▀▄█ █   █ ████  ████▀ ',
+    '  ▀   ▀   ▀ ▀▀▀▀▀ ▀   ▀ ▀▀▀▀  ▀▀▀▀▀ ▀  ▀▀ '
+  ];
+  const ASCII_CAL_BASE = [
+    '▄████ ▄███▄ █    ',
+    '█     █████ █    ',
+    '▀████ ▀   ▀ ▀▀▀▀▀'
+  ];
+  const ASCII_SPARK_CHARS = ['/', '\\', '*', '#', '+', '~'];
+  const ASCII_TOTAL_COLS = ASCII_THUNDER_BASE[0].length + ASCII_CAL_BASE[0].length;
+
+  let asciiTick = 0;
+  let asciiTimerId = null;
+  let asciiThunderText = ASCII_THUNDER_BASE.join('\n');
+  let asciiCalText = ASCII_CAL_BASE.join('\n');
+
+  function transformAsciiLines(baseLines, colOffset, waveCol, tickNum) {
+    return baseLines
+      .map((line, rowIdx) => {
+        let out = '';
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === ' ') {
+            out += ' ';
+            continue;
+          }
+          const globalCol = colOffset + i;
+          const dist = waveCol - globalCol;
+          if (dist === 0) {
+            out += ASCII_SPARK_CHARS[(globalCol + rowIdx + tickNum) % ASCII_SPARK_CHARS.length];
+          } else if (dist === 1 || dist === -1) {
+            out += '▓';
+          } else if (dist === 2) {
+            out += '▒';
+          } else if (dist === 3) {
+            out += '░';
+          } else {
+            out += ch;
+          }
+        }
+        return out;
+      })
+      .join('\n');
+  }
+
+  function stepAsciiAnimation() {
+    // 59 columns + 35 ticks of calm pause between electric sweeps
+    const cycleLen = ASCII_TOTAL_COLS + 35;
+    const waveCol = (asciiTick % cycleLen) - 2;
+    asciiThunderText = transformAsciiLines(ASCII_THUNDER_BASE, 0, waveCol, asciiTick);
+    asciiCalText = transformAsciiLines(
+      ASCII_CAL_BASE,
+      ASCII_THUNDER_BASE[0].length,
+      waveCol,
+      asciiTick
+    );
+    asciiTick += 1;
+  }
+
+  function triggerAsciiSurge() {
+    asciiTick = 0;
+    stepAsciiAnimation();
+  }
+
+  function startAsciiAnimation() {
+    stopAsciiAnimation();
+    stepAsciiAnimation();
+    asciiTimerId = setInterval(stepAsciiAnimation, 55);
+  }
+
+  function stopAsciiAnimation() {
+    if (asciiTimerId) {
+      clearInterval(asciiTimerId);
+      asciiTimerId = null;
+    }
+  }
+
   // CardDAV contacts & attendee autocomplete state
   let contacts = [];
   let attendeeQuery = '';
@@ -438,7 +518,7 @@
             const bgColor = ev.backgroundColor || ev.color || ev.extendedProps?.color;
             const readOnly = Boolean(ev.readOnly || ev.extendedProps?.readOnly);
             const calendarName =
-              ev.calendarName || ev.extendedProps?.calendarName || 'Ukko Calendar';
+              ev.calendarName || ev.extendedProps?.calendarName || 'Thundercal';
 
             const mapped = {
               id: ev.id || ev.uid,
@@ -1073,7 +1153,7 @@
         ? ecEvent.extendedProps.attendees
         : [],
       readOnly: Boolean(ecEvent.extendedProps?.readOnly),
-      calendarName: ecEvent.extendedProps?.calendarName || 'Ukko Calendar',
+      calendarName: ecEvent.extendedProps?.calendarName || 'Thundercal',
       color: ecEvent.extendedProps?.color || '#2563eb'
     };
     deleteError = '';
@@ -1235,10 +1315,10 @@
     }
 
     try {
-      const n = new Notification('Ukko Calendar — Test Notification', {
+      const n = new Notification('Thundercal — Test Notification', {
         body: `Desktop reminders are active (${notificationSettings.leadMinutes} min before events).`,
-        icon: '/apple-touch-icon.png',
-        badge: '/favicon.png',
+        icon: '/apple-touch-icon.png?v=2',
+        badge: '/favicon.png?v=2',
         tag: `ukko-test-${Date.now()}`
       });
       n.onclick = () => {
@@ -1298,7 +1378,11 @@
         : `Starts in ${minutesLeft} min`;
 
     const lines = [`${whenLabel} • ${timeStr} (${estStr} EST)`];
-    if (ev.extendedProps?.calendarName && ev.extendedProps.calendarName !== 'Ukko Calendar') {
+    if (
+      ev.extendedProps?.calendarName &&
+      ev.extendedProps.calendarName !== 'Thundercal' &&
+      ev.extendedProps.calendarName !== 'Ukko Calendar'
+    ) {
       lines.push(`Calendar: ${ev.extendedProps.calendarName}`);
     }
     if (ev.extendedProps?.location) {
@@ -1308,8 +1392,8 @@
     try {
       const n = new Notification(ev.title || '(No Title)', {
         body: lines.join('\n'),
-        icon: '/apple-touch-icon.png',
-        badge: '/favicon.png',
+        icon: '/apple-touch-icon.png?v=2',
+        badge: '/favicon.png?v=2',
         tag: tagKey
       });
       n.onclick = () => {
@@ -1461,6 +1545,7 @@
   onMount(() => {
     initTheme();
     initNotifications();
+    startAsciiAnimation();
     fetchAppVersion();
     if (authenticated) {
       initCalendar();
@@ -1471,6 +1556,7 @@
   });
 
   onDestroy(() => {
+    stopAsciiAnimation();
     stopNotificationTimers();
     destroyCalendar();
   });
@@ -1481,23 +1567,17 @@
     <form class="auth-card" on:submit={handleLogin}>
       <div class="auth-header-row">
         <div class="auth-header">
-          <div class="logo-lockup logo-lockup-auth" aria-label="Ukko Cal">
-            <svg class="logo-mark-svg" viewBox="130 110 764 680" role="img" aria-hidden="true">
-              <defs>
-                <mask id="ukko-auth-mark-mask">
-                  <image href="/logo.jpg" width="1024" height="1024" />
-                </mask>
-              </defs>
-              <rect
-                x="0"
-                y="0"
-                width="1024"
-                height="1024"
-                fill="currentColor"
-                mask="url(#ukko-auth-mark-mask)"
-              />
-            </svg>
-            <span class="logo-wordmark">UKKO <span class="logo-wordmark-accent">CAL</span></span>
+          <div
+            class="logo-lockup logo-lockup-auth"
+            aria-label="Thundercal"
+            on:mouseenter={triggerAsciiSurge}
+            role="img"
+          >
+            <img class="logo-mark-img" src="/logo.png" alt="Thundercal logo" />
+            <div class="ascii-wordmark" aria-hidden="true">
+              <pre class="ascii-part ascii-thunder">{asciiThunderText}</pre>
+              <pre class="ascii-part ascii-cal">{asciiCalText}</pre>
+            </div>
           </div>
           <p>Enter your passcode to access your Thundermail calendar.</p>
         </div>
@@ -1544,23 +1624,17 @@
 
     <header class="header">
       <div class="header-left">
-        <div class="logo-lockup" aria-label="Ukko Cal">
-          <svg class="logo-mark-svg" viewBox="130 110 764 680" role="img" aria-hidden="true">
-            <defs>
-              <mask id="ukko-header-mark-mask">
-                <image href="/logo.jpg" width="1024" height="1024" />
-              </mask>
-            </defs>
-            <rect
-              x="0"
-              y="0"
-              width="1024"
-              height="1024"
-              fill="currentColor"
-              mask="url(#ukko-header-mark-mask)"
-            />
-          </svg>
-          <span class="logo-wordmark">UKKO <span class="logo-wordmark-accent">CAL</span></span>
+        <div
+          class="logo-lockup"
+          aria-label="Thundercal"
+          on:mouseenter={triggerAsciiSurge}
+          role="img"
+        >
+          <img class="logo-mark-img" src="/logo.png" alt="Thundercal logo" />
+          <div class="ascii-wordmark" aria-hidden="true">
+            <pre class="ascii-part ascii-thunder">{asciiThunderText}</pre>
+            <pre class="ascii-part ascii-cal">{asciiCalText}</pre>
+          </div>
         </div>
         {#if loadingEvents || importingIcs}
           <span class="status-pill">
@@ -1636,7 +1710,7 @@
       <div class="calendar-legend">
         <span class="legend-chip">
           <span class="legend-dot" style="background: #039be5;"></span>
-          <span>Ukko Calendar</span>
+          <span>Thundercal</span>
         </span>
         {#each subscriptions as sub (sub.id)}
           <button
@@ -1690,7 +1764,7 @@
               <div class="sub-item-left">
                 <span class="legend-dot" style="background: #039be5;"></span>
                 <div>
-                  <div class="sub-item-name">Ukko Calendar (Primary)</div>
+                  <div class="sub-item-name">Thundercal (Primary)</div>
                   <div class="sub-item-meta">Thundermail CalDAV • Read &amp; Write</div>
                 </div>
               </div>
@@ -2052,7 +2126,7 @@
             <h2 id="detail-modal-title">{selectedEvent.title}</h2>
             <div class="detail-calendar-badge">
               <span class="legend-dot" style="background: {selectedEvent.color || '#039be5'};"></span>
-              <span>{selectedEvent.calendarName || 'Ukko Calendar'}</span>
+              <span>{selectedEvent.calendarName || 'Thundercal'}</span>
               {#if selectedEvent.readOnly}
                 <span class="readonly-tag">Subscribed</span>
               {/if}
@@ -2345,32 +2419,67 @@
     user-select: none;
   }
 
-  .logo-lockup .logo-mark-svg {
-    height: 2.35rem;
-    width: auto;
+  .logo-lockup .logo-mark-img {
+    height: 2.75rem;
+    width: 2.75rem;
+    object-fit: contain;
     display: block;
     flex-shrink: 0;
+    filter: drop-shadow(0 2px 6px rgba(37, 99, 235, 0.28));
+    transition: transform 0.2s ease, filter 0.2s ease;
   }
 
-  .logo-wordmark {
-    font-size: 1.45rem;
-    font-weight: 900;
-    letter-spacing: 0.14em;
-    line-height: 1;
+  .logo-lockup:hover .logo-mark-img {
+    transform: scale(1.06) rotate(-3deg);
+    filter: drop-shadow(0 3px 10px rgba(99, 102, 241, 0.45));
+  }
+
+  .ascii-wordmark {
+    display: inline-flex;
+    align-items: center;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+
+  .ascii-part {
+    margin: 0;
+    padding: 0;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, 'Liberation Mono',
+      Menlo, monospace;
+    font-size: 0.46rem;
+    line-height: 1.05;
+    letter-spacing: 0.02em;
+    font-weight: 700;
+    white-space: pre;
+    animation: ascii-electric-glow 3.2s ease-in-out infinite;
+  }
+
+  .ascii-thunder {
     color: var(--text-primary);
-    text-transform: uppercase;
   }
 
-  .logo-wordmark-accent {
+  .ascii-cal {
     color: #3b82f6;
+    text-shadow: 0 0 8px rgba(59, 130, 246, 0.35);
   }
 
-  .logo-lockup-auth .logo-mark-svg {
-    height: 2.6rem;
+  @keyframes ascii-electric-glow {
+    0%,
+    100% {
+      filter: drop-shadow(0 0 0px rgba(59, 130, 246, 0));
+    }
+    50% {
+      filter: drop-shadow(0 0 5px rgba(99, 102, 241, 0.45));
+    }
   }
 
-  .logo-lockup-auth .logo-wordmark {
-    font-size: 1.55rem;
+  .logo-lockup-auth .logo-mark-img {
+    height: 2.9rem;
+    width: 2.9rem;
+  }
+
+  .logo-lockup-auth .ascii-part {
+    font-size: 0.42rem;
   }
 
   .container {
