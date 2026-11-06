@@ -35,17 +35,19 @@ defmodule Ukko.ICal do
   end
 
   defp parse_vevent_block(block) do
+    cleaned_block = String.replace(block, ~r/BEGIN:VALARM.*?END:VALARM\r?\n?/s, "")
+
     props =
-      block
+      cleaned_block
       |> String.split(~r/\r?\n/, trim: true)
       |> Enum.reduce(%{}, fn line, acc ->
-        case String.split(line, ":", parts: 2) do
-          [key_and_params, value] ->
+        case split_prop_line(line) do
+          {key_and_params, value} ->
             [prop_name | params] = String.split(key_and_params, ";")
             key = String.upcase(prop_name)
             Map.put_new(acc, key, {params, value})
 
-          _ ->
+          :error ->
             acc
         end
       end)
@@ -59,7 +61,7 @@ defmodule Ukko.ICal do
 
     if uid && dtstart do
       %{
-        id: uid,
+        id: "#{uid}::#{dtstart}",
         uid: uid,
         title: summary,
         start: dtstart,
@@ -67,12 +69,35 @@ defmodule Ukko.ICal do
         description: description,
         location: location,
         extendedProps: %{
+          uid: uid,
           description: description,
           location: location
         }
       }
     else
       nil
+    end
+  end
+
+  # Splits an iCalendar property line on the first `:` that is outside double quotes `"..."`.
+  defp split_prop_line(line) when is_binary(line) do
+    do_split_prop_line(line, 0, false)
+  end
+
+  defp do_split_prop_line(line, idx, _in_quotes) when idx >= byte_size(line), do: :error
+
+  defp do_split_prop_line(line, idx, in_quotes) do
+    case :binary.at(line, idx) do
+      ?" ->
+        do_split_prop_line(line, idx + 1, not in_quotes)
+
+      ?: when not in_quotes ->
+        key_part = binary_part(line, 0, idx)
+        val_part = binary_part(line, idx + 1, byte_size(line) - idx - 1)
+        {key_part, val_part}
+
+      _ ->
+        do_split_prop_line(line, idx + 1, in_quotes)
     end
   end
 

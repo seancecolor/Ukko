@@ -7,6 +7,10 @@
   import '@event-calendar/core/index.css';
 
   const TOKEN_KEY = 'ukko_auth_token';
+  const THEME_KEY = 'ukko_theme';
+
+  // Theme state
+  let darkMode = false;
 
   // Auth state
   let token = typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) || '' : '';
@@ -40,6 +44,46 @@
   let selectedEvent = null;
   let deletingEvent = false;
   let deleteError = '';
+
+  function initTheme() {
+    if (typeof window === 'undefined') return;
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === 'dark' || saved === 'light') {
+      darkMode = saved === 'dark';
+    } else if (window.matchMedia) {
+      darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+    applyTheme();
+  }
+
+  function applyTheme() {
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle('dark', darkMode);
+    }
+  }
+
+  function toggleTheme() {
+    darkMode = !darkMode;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(THEME_KEY, darkMode ? 'dark' : 'light');
+    }
+    applyTheme();
+  }
+
+  function formatApiError(data, fallback, status) {
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      if (data.error && data.details) {
+        return `${data.error}: ${data.details}`;
+      }
+      if (data.error) {
+        return data.error;
+      }
+      if (data.errors?.detail) {
+        return `${fallback} (${data.errors.detail})`;
+      }
+    }
+    return status ? `${fallback} (HTTP ${status})` : fallback;
+  }
 
   function authHeaders(extra = {}) {
     const headers = { ...extra };
@@ -103,7 +147,7 @@
       const data = await res.json().catch(() => ({}));
 
       if (!res.ok) {
-        authError = data.error || 'Invalid passcode';
+        authError = formatApiError(data, 'Invalid passcode', res.status);
         return;
       }
 
@@ -156,9 +200,9 @@
         return;
       }
 
-      const data = await res.json().catch(() => []);
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        bannerError = data.error || 'Failed to load calendar events.';
+        bannerError = formatApiError(data, 'Failed to load calendar events.', res.status);
         return;
       }
 
@@ -254,7 +298,7 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        createError = data.error || 'Failed to create event.';
+        createError = formatApiError(data, 'Failed to create event.', res.status);
         return;
       }
 
@@ -308,7 +352,7 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        deleteError = data.error || 'Failed to delete event.';
+        deleteError = formatApiError(data, 'Failed to delete event.', res.status);
         return;
       }
 
@@ -366,6 +410,7 @@
   }
 
   onMount(() => {
+    initTheme();
     if (authenticated) {
       initCalendar();
     }
@@ -379,9 +424,19 @@
 {#if !authenticated}
   <main class="auth-screen">
     <form class="auth-card" on:submit={handleLogin}>
-      <div class="auth-header">
-        <h1>Ukko Calendar</h1>
-        <p>Enter your passcode to access your Thundermail calendar.</p>
+      <div class="auth-header-row">
+        <div class="auth-header">
+          <h1>Ukko Calendar</h1>
+          <p>Enter your passcode to access your Thundermail calendar.</p>
+        </div>
+        <button
+          type="button"
+          class="btn btn-secondary btn-icon"
+          on:click={toggleTheme}
+          title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {darkMode ? '☀️' : '🌙'}
+        </button>
       </div>
 
       {#if authError}
@@ -418,6 +473,14 @@
         <button
           type="button"
           class="btn btn-secondary"
+          on:click={toggleTheme}
+          title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {darkMode ? '☀️ Light' : '🌙 Dark'}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary"
           on:click={() => fetchEvents()}
           disabled={loadingEvents}
         >
@@ -448,7 +511,11 @@
       </div>
     {/if}
 
-    <div class="calendar-wrapper" bind:this={calendarEl}></div>
+    <div
+      class="calendar-wrapper"
+      class:ec-dark={darkMode}
+      bind:this={calendarEl}
+    ></div>
   </main>
 
   {#if showCreateModal}
@@ -635,26 +702,34 @@
   }
 
   .auth-card {
-    background: #ffffff;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
     border-radius: 0.75rem;
     padding: 2rem;
     width: 100%;
-    max-width: 400px;
-    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.08);
+    max-width: 420px;
+    box-shadow: var(--shadow-card);
     display: flex;
     flex-direction: column;
     gap: 1.25rem;
   }
 
+  .auth-header-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
   .auth-header h1 {
     margin: 0 0 0.25rem;
     font-size: 1.5rem;
-    color: #0f172a;
+    color: var(--text-primary);
   }
 
   .auth-header p {
     margin: 0;
-    color: #64748b;
+    color: var(--text-muted);
     font-size: 0.925rem;
   }
 
@@ -686,13 +761,13 @@
   .header h1 {
     margin: 0;
     font-size: 1.5rem;
-    color: #0f172a;
+    color: var(--text-primary);
   }
 
   .status-pill {
     font-size: 0.8rem;
-    background: #e0f2fe;
-    color: #0369a1;
+    background: var(--pill-bg);
+    color: var(--pill-text);
     padding: 0.2rem 0.65rem;
     border-radius: 999px;
     font-weight: 500;
@@ -702,13 +777,15 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
   }
 
   .calendar-wrapper {
-    background: #ffffff;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
     border-radius: 0.75rem;
     padding: 1rem;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+    box-shadow: var(--shadow-card);
     flex: 1;
   }
 
@@ -720,7 +797,12 @@
     font-size: 0.9rem;
     font-weight: 500;
     cursor: pointer;
-    transition: background-color 0.15s ease, border-color 0.15s ease;
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+
+  .btn-icon {
+    padding: 0.45rem 0.65rem;
+    line-height: 1;
   }
 
   .btn:disabled {
@@ -743,23 +825,23 @@
   }
 
   .btn-secondary {
-    background: #ffffff;
-    border-color: #cbd5e1;
-    color: #1e293b;
+    background: var(--bg-surface);
+    border-color: var(--border-color);
+    color: var(--text-primary);
   }
 
   .btn-secondary:hover:not(:disabled) {
-    background: #f1f5f9;
+    background: var(--bg-subtle);
   }
 
   .btn-ghost {
     background: transparent;
-    color: #64748b;
+    color: var(--text-muted);
   }
 
   .btn-ghost:hover:not(:disabled) {
-    background: #e2e8f0;
-    color: #0f172a;
+    background: var(--bg-subtle);
+    color: var(--text-primary);
   }
 
   .btn-danger {
@@ -778,30 +860,33 @@
     text-decoration: underline;
     cursor: pointer;
     font-size: 0.85rem;
+    flex-shrink: 0;
   }
 
   .alert {
     padding: 0.65rem 0.85rem;
     border-radius: 0.5rem;
     font-size: 0.875rem;
+    word-break: break-word;
   }
 
   .alert-error {
-    background: #fef2f2;
-    color: #b91c1c;
-    border: 1px solid #fecaca;
+    background: var(--error-bg);
+    color: var(--error-text);
+    border: 1px solid var(--error-border);
   }
 
   .banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 1rem;
   }
 
   .modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(15, 23, 42, 0.45);
+    background: rgba(2, 6, 23, 0.6);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -810,12 +895,13 @@
   }
 
   .modal {
-    background: #ffffff;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
     border-radius: 0.75rem;
     width: 100%;
     max-width: 520px;
     padding: 1.5rem;
-    box-shadow: 0 20px 35px rgba(15, 23, 42, 0.2);
+    box-shadow: var(--shadow-modal);
     display: flex;
     flex-direction: column;
     gap: 1rem;
@@ -831,7 +917,7 @@
   .modal-header h2 {
     margin: 0;
     font-size: 1.2rem;
-    color: #0f172a;
+    color: var(--text-primary);
   }
 
   .close-btn {
@@ -839,7 +925,7 @@
     border: none;
     font-size: 1.5rem;
     line-height: 1;
-    color: #64748b;
+    color: var(--text-muted);
     cursor: pointer;
   }
 
@@ -854,7 +940,7 @@
     flex-direction: column;
     gap: 0.35rem;
     font-size: 0.875rem;
-    color: #334155;
+    color: var(--text-secondary);
     flex: 1;
   }
 
@@ -865,18 +951,19 @@
   .field input,
   .field textarea {
     padding: 0.55rem 0.7rem;
-    border: 1px solid #cbd5e1;
+    background: var(--bg-page);
+    border: 1px solid var(--border-color);
     border-radius: 0.45rem;
     font-size: 0.925rem;
     font-family: inherit;
-    color: #0f172a;
+    color: var(--text-primary);
   }
 
   .field input:focus,
   .field textarea:focus {
     outline: none;
-    border-color: #2563eb;
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
   }
 
   .field-row {
@@ -890,7 +977,7 @@
     align-items: center;
     gap: 0.5rem;
     font-size: 0.9rem;
-    color: #1e293b;
+    color: var(--text-primary);
     cursor: pointer;
     user-select: none;
   }
@@ -911,6 +998,7 @@
     flex-direction: column;
     gap: 0.65rem;
     font-size: 0.925rem;
+    color: var(--text-secondary);
   }
 
   .detail-row {
@@ -920,20 +1008,20 @@
   }
 
   .zoom-link {
-    color: #2563eb;
+    color: var(--link-color);
     word-break: break-all;
   }
 
   .detail-description pre {
     margin: 0.4rem 0 0;
     padding: 0.75rem;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
+    background: var(--bg-page);
+    border: 1px solid var(--border-subtle);
     border-radius: 0.45rem;
     white-space: pre-wrap;
     word-break: break-word;
     font-family: inherit;
     font-size: 0.875rem;
-    color: #334155;
+    color: var(--text-secondary);
   }
 </style>

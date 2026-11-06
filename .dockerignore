@@ -9,3 +9,4 @@ priv/static/index.html
 .env.*
 erl_crash.dump
 npm-debug.log*
+

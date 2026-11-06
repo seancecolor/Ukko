@@ -3,8 +3,50 @@
     Ubuntu, Cantarell, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #1e293b;
-  background-color: #f8fafc;
+
+  --bg-page: #f8fafc;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f1f5f9;
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --border-color: #cbd5e1;
+  --border-subtle: #e2e8f0;
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.08);
+  --shadow-modal: 0 20px 35px rgba(15, 23, 42, 0.2);
+  --pill-bg: #e0f2fe;
+  --pill-text: #0369a1;
+  --error-bg: #fef2f2;
+  --error-text: #b91c1c;
+  --error-border: #fecaca;
+  --link-color: #2563eb;
+
+  color-scheme: light;
+  color: var(--text-primary);
+  background-color: var(--bg-page);
+}
+
+html.dark {
+  --bg-page: #0f172a;
+  --bg-surface: #1e293b;
+  --bg-subtle: #334155;
+  --text-primary: #f8fafc;
+  --text-secondary: #e2e8f0;
+  --text-muted: #94a3b8;
+  --border-color: #475569;
+  --border-subtle: #334155;
+  --shadow-card: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --shadow-modal: 0 20px 40px rgba(0, 0, 0, 0.55);
+  --pill-bg: #0c4a6e;
+  --pill-text: #7dd3fc;
+  --error-bg: #450a0a;
+  --error-text: #fca5a5;
+  --error-border: #7f1d1d;
+  --link-color: #60a5fa;
+
+  color-scheme: dark;
+  color: var(--text-primary);
+  background-color: var(--bg-page);
 }
 
 * {
@@ -14,6 +56,9 @@
 body {
   margin: 0;
   min-height: 100vh;
+  background-color: var(--bg-page);
+  color: var(--text-primary);
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 #app {
@@ -21,4 +66,3 @@ body {
   display: flex;
   flex-direction: column;
 }
-

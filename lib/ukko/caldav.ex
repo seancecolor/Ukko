@@ -23,10 +23,11 @@ defmodule Ukko.CalDAV do
                {"depth", "1"},
                {"content-type", "application/xml; charset=utf-8"}
              ],
-             body: xml_body
+             body: xml_body,
+             decode_body: false
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
-          events = parse_multistatus_response(body)
+          events = parse_multistatus_response(to_string(body))
           {:ok, events}
 
         {:ok, %Req.Response{status: status, body: body}} ->
@@ -36,6 +37,8 @@ defmodule Ukko.CalDAV do
           {:error, exception}
       end
     end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
   end
 
   @doc """
@@ -49,7 +52,8 @@ defmodule Ukko.CalDAV do
       case Req.put(event_url,
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
              headers: [{"content-type", "text/calendar; charset=utf-8"}],
-             body: ics_payload
+             body: ics_payload,
+             decode_body: false
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 201, 204] ->
           {:ok, uid}
@@ -61,6 +65,8 @@ defmodule Ukko.CalDAV do
           {:error, exception}
       end
     end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
   end
 
   @doc """
@@ -71,9 +77,18 @@ defmodule Ukko.CalDAV do
       event_url = build_event_url(cfg.url, uid)
 
       case Req.delete(event_url,
-             auth: {:basic, "#{cfg.user}:#{cfg.pass}"}
+             auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+             decode_body: false
            ) do
-        {:ok, %Req.Response{status: status}} when status in [200, 202, 204, 404] ->
+        {:ok, %Req.Response{status: status}} when status in [200, 202, 204] ->
+          :ok
+
+        {:ok, %Req.Response{status: 404}} ->
+          if String.contains?(uid, "@") do
+            alt_url = build_event_url(cfg.url, String.replace(uid, "@", "_"))
+            _ = Req.delete(alt_url, auth: {:basic, "#{cfg.user}:#{cfg.pass}"}, decode_body: false)
+          end
+
           :ok
 
         {:ok, %Req.Response{status: status, body: body}} ->
@@ -83,6 +98,8 @@ defmodule Ukko.CalDAV do
           {:error, exception}
       end
     end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
   end
 
   @doc """
@@ -92,7 +109,11 @@ defmodule Ukko.CalDAV do
     xml_body
     |> xpath(~x"//*[local-name()='calendar-data']"l)
     |> Enum.flat_map(fn node ->
-      ics_data = xpath(node, ~x"./text()"s)
+      ics_data =
+        node
+        |> xpath(~x"./text()"ls)
+        |> Enum.join("")
+
       ICal.parse_vevents(ics_data)
     end)
   rescue
@@ -102,23 +123,31 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Builds the CalDAV `calendar-query` XML payload, including `<C:time-range>` when `start_iso`
-  or `end_iso` are given.
+  Builds the CalDAV `calendar-query` XML payload, including `<C:time-range>` and `<C:expand>`
+  when `start_iso` and `end_iso` are given.
   """
   def build_report_xml(start_iso, end_iso) do
-    time_range_tag =
+    {calendar_data_tag, time_range_tag} =
       case {non_empty(start_iso), non_empty(end_iso)} do
         {nil, nil} ->
-          ""
+          {"<C:calendar-data/>", ""}
 
         {s, nil} ->
-          ~s(<C:time-range start="#{ICal.iso8601_to_ical_utc(s)}"/>)
+          start_utc = ICal.iso8601_to_ical_utc(s)
+          {"<C:calendar-data/>", ~s(<C:time-range start="#{start_utc}"/>)}
 
         {nil, e} ->
-          ~s(<C:time-range end="#{ICal.iso8601_to_ical_utc(e)}"/>)
+          end_utc = ICal.iso8601_to_ical_utc(e)
+          {"<C:calendar-data/>", ~s(<C:time-range end="#{end_utc}"/>)}
 
         {s, e} ->
-          ~s(<C:time-range start="#{ICal.iso8601_to_ical_utc(s)}" end="#{ICal.iso8601_to_ical_utc(e)}"/>)
+          start_utc = ICal.iso8601_to_ical_utc(s)
+          end_utc = ICal.iso8601_to_ical_utc(e)
+
+          {
+            ~s(<C:calendar-data><C:expand start="#{start_utc}" end="#{end_utc}"/></C:calendar-data>),
+            ~s(<C:time-range start="#{start_utc}" end="#{end_utc}"/>)
+          }
       end
 
     """
@@ -126,7 +155,7 @@ defmodule Ukko.CalDAV do
     <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
       <D:prop>
         <D:getetag/>
-        <C:calendar-data/>
+        #{calendar_data_tag}
       </D:prop>
       <C:filter>
         <C:comp-filter name="VCALENDAR">
@@ -155,9 +184,9 @@ defmodule Ukko.CalDAV do
   end
 
   defp get_config do
-    url = Application.get_env(:ukko, :thundermail_caldav_url)
-    user = Application.get_env(:ukko, :thundermail_user)
-    pass = Application.get_env(:ukko, :thundermail_pass)
+    url = non_empty(Application.get_env(:ukko, :thundermail_caldav_url))
+    user = non_empty(Application.get_env(:ukko, :thundermail_user))
+    pass = non_empty(Application.get_env(:ukko, :thundermail_pass))
 
     if is_nil(url) or is_nil(user) or is_nil(pass) do
       {:error, :missing_caldav_credentials}

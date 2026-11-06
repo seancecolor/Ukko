@@ -60,6 +60,7 @@ COPY --from=elixir-builder --chown=nobody:root /app/_build/prod/rel/ukko ./
 
 USER nobody
 
-EXPOSE 4000
+EXPOSE 8080
 
 CMD ["/app/bin/ukko", "start"]
+

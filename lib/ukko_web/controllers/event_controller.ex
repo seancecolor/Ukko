@@ -19,7 +19,10 @@ defmodule UkkoWeb.EventController do
       {:error, reason} ->
         conn
         |> put_status(:bad_gateway)
-        |> json(%{error: "Failed to fetch CalDAV events", details: inspect(reason)})
+        |> json(%{
+          error: "Failed to fetch CalDAV events",
+          details: format_reason(reason)
+        })
     end
   end
 
@@ -74,12 +77,18 @@ defmodule UkkoWeb.EventController do
         {:error, {:zoom_error, reason}} ->
           conn
           |> put_status(:bad_gateway)
-          |> json(%{error: "Failed to create Zoom meeting", details: inspect(reason)})
+          |> json(%{
+            error: "Failed to create Zoom meeting",
+            details: format_reason(reason)
+          })
 
         {:error, reason} ->
           conn
           |> put_status(:bad_gateway)
-          |> json(%{error: "Failed to save event to CalDAV", details: inspect(reason)})
+          |> json(%{
+            error: "Failed to save event to CalDAV",
+            details: format_reason(reason)
+          })
       end
     end
   end
@@ -97,7 +106,10 @@ defmodule UkkoWeb.EventController do
       {:error, reason} ->
         conn
         |> put_status(:bad_gateway)
-        |> json(%{error: "Failed to delete event from CalDAV", details: inspect(reason)})
+        |> json(%{
+          error: "Failed to delete event from CalDAV",
+          details: format_reason(reason)
+        })
     end
   end
 
@@ -118,6 +130,38 @@ defmodule UkkoWeb.EventController do
       {:error, reason} ->
         {:error, {:zoom_error, reason}}
     end
+  end
+
+  defp format_reason(:missing_caldav_credentials) do
+    "Missing THUNDERMAIL_CALDAV_URL, THUNDERMAIL_USER, or THUNDERMAIL_PASS environment variable."
+  end
+
+  defp format_reason(:missing_zoom_credentials) do
+    "Missing ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, or ZOOM_CLIENT_SECRET environment variable."
+  end
+
+  defp format_reason({:caldav_error, 401, _body}) do
+    "CalDAV returned 401 Unauthorized — check THUNDERMAIL_USER and THUNDERMAIL_PASS (Thundermail requires an App Password for CalDAV if 2FA/SSO is used)."
+  end
+
+  defp format_reason({:caldav_error, 403, _body}) do
+    "CalDAV returned 403 Forbidden — check calendar permissions and THUNDERMAIL_CALDAV_URL."
+  end
+
+  defp format_reason({:caldav_error, 404, _body}) do
+    "CalDAV returned 404 Not Found — verify THUNDERMAIL_CALDAV_URL points to the calendar collection."
+  end
+
+  defp format_reason({:caldav_error, status, body}) do
+    "CalDAV HTTP #{status}: #{inspect(body)}"
+  end
+
+  defp format_reason({:exception, msg}) do
+    msg
+  end
+
+  defp format_reason(other) do
+    inspect(other)
   end
 
   defp truthy?(true), do: true

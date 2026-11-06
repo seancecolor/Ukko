@@ -18,7 +18,7 @@ defmodule Ukko.ICalTest do
 
     assert [event] = ICal.parse_vevents(ics)
     assert event.uid == uid
-    assert event.id == uid
+    assert event.id == "#{uid}::2026-11-05T15:00:00Z"
     assert event.title == "Team Sync, Q4"
     assert event.start == "2026-11-05T15:00:00Z"
     assert event.end == "2026-11-05T15:30:00Z"
@@ -26,7 +26,7 @@ defmodule Ukko.ICalTest do
     assert event.location == "https://zoom.us/j/123456789"
   end
 
-  test "parses CalDAV multistatus XML response" do
+  test "parses CalDAV multistatus XML response with CDATA, ALTREP, and VALARM" do
     xml = """
     <?xml version="1.0" encoding="utf-8"?>
     <d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
@@ -35,17 +35,21 @@ defmodule Ukko.ICalTest do
         <d:propstat>
           <d:prop>
             <d:getetag>"12345"</d:getetag>
-            <cal:calendar-data>BEGIN:VCALENDAR
+            <cal:calendar-data><![CDATA[BEGIN:VCALENDAR
     VERSION:2.0
     BEGIN:VEVENT
     UID:evt-1
     DTSTART:20261106T100000Z
     DTEND:20261106T110000Z
     SUMMARY:Design Review
-    DESCRIPTION:Review mockups
+    DESCRIPTION;ALTREP="data:text/html;base64,abc=":Review mockups
     LOCATION:Room 101
+    BEGIN:VALARM
+    ACTION:DISPLAY
+    DESCRIPTION:Alarm description should be ignored
+    END:VALARM
     END:VEVENT
-    END:VCALENDAR</cal:calendar-data>
+    END:VCALENDAR]]></cal:calendar-data>
           </d:prop>
           <d:status>HTTP/1.1 200 OK</d:status>
         </d:propstat>
