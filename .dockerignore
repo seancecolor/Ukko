@@ -5,6 +5,7 @@ frontend/node_modules
 frontend/dist
 priv/static/assets
 priv/static/index.html
+priv/static/logo.jpg
 .env
 .env.*
 erl_crash.dump

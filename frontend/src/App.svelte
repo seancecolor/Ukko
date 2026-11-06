@@ -35,6 +35,7 @@
     title: '',
     start: '',
     end: '',
+    all_day: false,
     location: '',
     description: '',
     create_zoom: false
@@ -75,6 +76,7 @@
   const localTzLabel = getTzAbbreviation();
   const estTzLabel = 'EST';
 
+  // EST on the left, PST (current timezone) first on the right next to the grid
   function formatDualSlotLabel(date) {
     const hasMinutes = date.getMinutes() !== 0;
     const localLabel = hasMinutes
@@ -85,13 +87,13 @@
       : estHourFormatter.format(date);
 
     return {
-      html: `<span class="tz-dual-slot"><span class="tz-col tz-local">${localLabel}</span><span class="tz-col tz-est">${estLabel}</span></span>`
+      html: `<span class="tz-dual-slot"><span class="tz-col tz-est">${estLabel}</span><span class="tz-col tz-local">${localLabel}</span></span>`
     };
   }
 
   function createDualSidebarHeader() {
     return {
-      html: `<span class="tz-header-only tz-dual-slot tz-dual-header"><span class="tz-col tz-local">${localTzLabel}</span><span class="tz-col tz-est">${estTzLabel}</span></span><span class="tz-allday-only">all-day</span>`
+      html: `<span class="tz-header-only tz-dual-slot tz-dual-header"><span class="tz-col tz-est">${estTzLabel}</span><span class="tz-col tz-local">${localTzLabel}</span></span><span class="tz-allday-only">all-day</span>`
     };
   }
 
@@ -155,15 +157,55 @@
     return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
   }
 
-  function localInputToIso(value) {
+  function localInputToIso(value, isAllDay = false) {
     if (!value) return null;
+    if (isAllDay) {
+      return String(value).slice(0, 10);
+    }
     const d = new Date(value);
     if (Number.isNaN(d.getTime())) return value;
     return d.toISOString();
   }
 
-  function formatDateTime(value) {
+  function isEventAllDay(ev) {
+    if (ev.allDay === true) return true;
+    const s = typeof ev.start === 'string' ? ev.start.trim() : '';
+    const e = typeof ev.end === 'string' ? ev.end.trim() : s;
+    if (s.length === 10) return true;
+    if (
+      s !== e &&
+      (s.endsWith('T00:00:00Z') || s.endsWith('T00:00:00')) &&
+      (e.endsWith('T00:00:00Z') || e.endsWith('T00:00:00'))
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function parseTimedDate(val) {
+    if (val instanceof Date) return val;
+    if (typeof val === 'string' && val.endsWith('Z')) {
+      const d = new Date(val);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    return val;
+  }
+
+  function formatDateTime(value, allDay = false) {
     if (!value) return '';
+    if (allDay) {
+      const dateStr = value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+      const [y, m, d] = dateStr.split('-').map(Number);
+      if (y && m && d) {
+        return new Date(y, m - 1, d).toLocaleDateString('en-US', {
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric'
+        }) + ' (All day)';
+      }
+      return `${dateStr} (All day)`;
+    }
     const d = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(d.getTime())) return String(value);
     const localStr = d.toLocaleString('en-US', {
@@ -264,17 +306,25 @@
       }
 
       events = Array.isArray(data)
-        ? data.map((ev) => ({
-            id: ev.id || ev.uid,
-            title: ev.title || '(No Title)',
-            start: ev.start,
-            end: ev.end || ev.start,
-            extendedProps: {
-              uid: ev.uid || ev.id,
-              description: ev.description ?? ev.extendedProps?.description ?? '',
-              location: ev.location ?? ev.extendedProps?.location ?? ''
-            }
-          }))
+        ? data.map((ev) => {
+            const allDay = isEventAllDay(ev);
+            const rawStart = ev.start;
+            const rawEnd = ev.end || ev.start;
+
+            return {
+              id: ev.id || ev.uid,
+              title: ev.title || '(No Title)',
+              allDay,
+              start: allDay ? String(rawStart).slice(0, 10) : parseTimedDate(rawStart),
+              end: allDay ? String(rawEnd).slice(0, 10) : parseTimedDate(rawEnd),
+              extendedProps: {
+                uid: ev.uid || ev.id,
+                allDay,
+                description: ev.description ?? ev.extendedProps?.description ?? '',
+                location: ev.location ?? ev.extendedProps?.location ?? ''
+              }
+            };
+          })
         : [];
 
       if (calendar) {
@@ -287,7 +337,7 @@
     }
   }
 
-  function openCreateModal(startDate, endDate) {
+  function openCreateModal(startDate, endDate, allDay = false) {
     const now = new Date();
     now.setMinutes(0, 0, 0);
     now.setHours(now.getHours() + 1);
@@ -301,6 +351,7 @@
       title: '',
       start: toLocalInputValue(start),
       end: toLocalInputValue(end),
+      all_day: Boolean(allDay),
       location: '',
       description: '',
       create_zoom: false
@@ -327,10 +378,20 @@
     creatingEvent = true;
 
     try {
+      const isAllDay = Boolean(newEvent.all_day);
+      let startVal = localInputToIso(newEvent.start, isAllDay);
+      let endVal = localInputToIso(newEvent.end || newEvent.start, isAllDay);
+
+      if (isAllDay && startVal === endVal) {
+        const [y, m, d] = startVal.split('-').map(Number);
+        const nextDay = new Date(Date.UTC(y, m - 1, d + 1));
+        endVal = nextDay.toISOString().slice(0, 10);
+      }
+
       const payload = {
         title: newEvent.title.trim(),
-        start: localInputToIso(newEvent.start),
-        end: localInputToIso(newEvent.end || newEvent.start),
+        start: startVal,
+        end: endVal,
         location: newEvent.location.trim(),
         description: newEvent.description.trim(),
         create_zoom: Boolean(newEvent.create_zoom)
@@ -373,6 +434,7 @@
     selectedEvent = {
       uid,
       title: ecEvent.title,
+      allDay: Boolean(ecEvent.allDay || ecEvent.extendedProps?.allDay),
       start: ecEvent.start,
       end: ecEvent.end,
       location: ecEvent.extendedProps?.location || '',
@@ -446,12 +508,12 @@
             fetchEvents(info.start, info.end);
           },
           select: (info) => {
-            openCreateModal(info.start, info.end);
+            openCreateModal(info.start, info.end, info.allDay);
           },
           dateClick: (info) => {
             const start = info.date;
             const end = new Date(start.getTime() + 60 * 60 * 1000);
-            openCreateModal(start, end);
+            openCreateModal(start, end, info.allDay);
           },
           eventClick: (info) => {
             openEventDetails(info.event);
@@ -485,7 +547,38 @@
     <form class="auth-card" on:submit={handleLogin}>
       <div class="auth-header-row">
         <div class="auth-header">
-          <h1>Ukko Calendar</h1>
+          <div class="logo-lockup logo-lockup-auth" aria-label="Ukko Cal">
+            <svg class="logo-mark-svg" viewBox="130 110 764 680" role="img" aria-hidden="true">
+              <defs>
+                <mask id="ukko-auth-mark-mask">
+                  <image href="/logo.jpg" width="1024" height="1024" />
+                </mask>
+              </defs>
+              <rect
+                x="0"
+                y="0"
+                width="1024"
+                height="1024"
+                fill="currentColor"
+                mask="url(#ukko-auth-mark-mask)"
+              />
+            </svg>
+            <svg class="logo-word-svg" viewBox="0 885 1024 120" role="img" aria-hidden="true">
+              <defs>
+                <mask id="ukko-auth-word-mask">
+                  <image href="/logo.jpg" width="1024" height="1024" />
+                </mask>
+              </defs>
+              <rect
+                x="0"
+                y="0"
+                width="1024"
+                height="1024"
+                fill="currentColor"
+                mask="url(#ukko-auth-word-mask)"
+              />
+            </svg>
+          </div>
           <p>Enter your passcode to access your Thundermail calendar.</p>
         </div>
         <button
@@ -522,7 +615,38 @@
   <main class="container">
     <header class="header">
       <div class="header-left">
-        <h1>Ukko Calendar</h1>
+        <div class="logo-lockup" aria-label="Ukko Cal">
+          <svg class="logo-mark-svg" viewBox="130 110 764 680" role="img" aria-hidden="true">
+            <defs>
+              <mask id="ukko-header-mark-mask">
+                <image href="/logo.jpg" width="1024" height="1024" />
+              </mask>
+            </defs>
+            <rect
+              x="0"
+              y="0"
+              width="1024"
+              height="1024"
+              fill="currentColor"
+              mask="url(#ukko-header-mark-mask)"
+            />
+          </svg>
+          <svg class="logo-word-svg" viewBox="0 885 1024 120" role="img" aria-hidden="true">
+            <defs>
+              <mask id="ukko-header-word-mask">
+                <image href="/logo.jpg" width="1024" height="1024" />
+              </mask>
+            </defs>
+            <rect
+              x="0"
+              y="0"
+              width="1024"
+              height="1024"
+              fill="currentColor"
+              mask="url(#ukko-header-word-mask)"
+            />
+          </svg>
+        </div>
         {#if loadingEvents}
           <span class="status-pill">Syncing CalDAV...</span>
         {/if}
@@ -601,6 +725,15 @@
               required
               disabled={creatingEvent}
             />
+          </label>
+
+          <label class="checkbox-field">
+            <input
+              type="checkbox"
+              bind:checked={newEvent.all_day}
+              disabled={creatingEvent}
+            />
+            <span>All-day event</span>
           </label>
 
           <div class="field-row">
@@ -693,12 +826,12 @@
         <div class="event-details">
           <div class="detail-row">
             <strong>Starts:</strong>
-            <span>{formatDateTime(selectedEvent.start)}</span>
+            <span>{formatDateTime(selectedEvent.start, selectedEvent.allDay)}</span>
           </div>
-          {#if selectedEvent.end}
+          {#if selectedEvent.end && !selectedEvent.allDay}
             <div class="detail-row">
               <strong>Ends:</strong>
-              <span>{formatDateTime(selectedEvent.end)}</span>
+              <span>{formatDateTime(selectedEvent.end, false)}</span>
             </div>
           {/if}
 
@@ -780,16 +913,40 @@
     gap: 0.75rem;
   }
 
-  .auth-header h1 {
-    margin: 0 0 0.25rem;
-    font-size: 1.5rem;
-    color: var(--text-primary);
-  }
-
   .auth-header p {
-    margin: 0;
+    margin: 0.65rem 0 0;
     color: var(--text-muted);
     font-size: 0.925rem;
+  }
+
+  .logo-lockup {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.65rem;
+    color: var(--text-primary);
+    user-select: none;
+  }
+
+  .logo-lockup .logo-mark-svg {
+    height: 2.35rem;
+    width: auto;
+    display: block;
+    flex-shrink: 0;
+  }
+
+  .logo-lockup .logo-word-svg {
+    height: 1.15rem;
+    width: auto;
+    display: block;
+    flex-shrink: 0;
+  }
+
+  .logo-lockup-auth .logo-mark-svg {
+    height: 2.6rem;
+  }
+
+  .logo-lockup-auth .logo-word-svg {
+    height: 1.25rem;
   }
 
   .container {
@@ -814,13 +971,7 @@
   .header-left {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-  }
-
-  .header h1 {
-    margin: 0;
-    font-size: 1.5rem;
-    color: var(--text-primary);
+    gap: 0.85rem;
   }
 
   .status-pill {

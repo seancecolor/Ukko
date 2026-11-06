@@ -60,12 +60,17 @@ defmodule Ukko.ICal do
     dtend = get_prop_datetime(props, "DTEND") || dtstart
 
     if uid && dtstart do
+      all_day = all_day_event?(props, dtstart, dtend)
+      norm_start = if all_day, do: String.slice(dtstart, 0, 10), else: dtstart
+      norm_end = if all_day, do: String.slice(dtend, 0, 10), else: dtend
+
       %{
-        id: "#{uid}::#{dtstart}",
+        id: "#{uid}::#{norm_start}",
         uid: uid,
         title: summary,
-        start: dtstart,
-        end: dtend,
+        start: norm_start,
+        end: norm_end,
+        allDay: all_day,
         description: description,
         location: location,
         extendedProps: %{
@@ -77,6 +82,26 @@ defmodule Ukko.ICal do
     else
       nil
     end
+  end
+
+  defp all_day_event?(props, dtstart, dtend) do
+    has_date_param =
+      case Map.get(props, "DTSTART") do
+        {params, _} ->
+          Enum.any?(params, fn p -> String.upcase(p) == "VALUE=DATE" end)
+
+        _ ->
+          false
+      end
+
+    date_only_format = String.length(dtstart) == 10
+
+    expanded_midnight_utc =
+      dtstart != dtend and
+        (String.ends_with?(dtstart, "T00:00:00Z") or String.ends_with?(dtstart, "T00:00:00")) and
+        (String.ends_with?(dtend, "T00:00:00Z") or String.ends_with?(dtend, "T00:00:00"))
+
+    has_date_param or date_only_format or expanded_midnight_utc
   end
 
   # Splits an iCalendar property line on the first `:` that is outside double quotes `"..."`.

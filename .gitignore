@@ -4,6 +4,7 @@
 /*.ez
 /priv/static/assets/
 /priv/static/index.html
+/priv/static/logo.jpg
 erl_crash.dump
 
 # Node / Svelte

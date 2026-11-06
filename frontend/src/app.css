@@ -67,7 +67,7 @@ body {
   flex-direction: column;
 }
 
-/* Dual Timezone Bar (PST / Local + EST) in @event-calendar/time-grid */
+/* Dual Timezone Bar (EST on left, PST / Local on right) in @event-calendar/time-grid */
 .ec-time-grid .ec-sidebar {
   padding: 0 6px;
 }
@@ -118,12 +118,12 @@ body {
   white-space: nowrap;
 }
 
+.tz-dual-slot .tz-est {
+  color: var(--text-muted);
+}
+
 .tz-dual-slot .tz-local {
   color: var(--text-primary);
   font-weight: 600;
-}
-
-.tz-dual-slot .tz-est {
-  color: var(--text-muted);
   border-left: 1px solid var(--border-subtle);
 }

@@ -4,7 +4,7 @@ defmodule UkkoWeb do
   as controllers, components, channels, and so on.
   """
 
-  def static_paths, do: ~w(assets fonts images favicon.ico robots.txt index.html vite.svg)
+  def static_paths, do: ~w(assets fonts images favicon.ico robots.txt index.html vite.svg logo.jpg)
 
   def router do
     quote do
