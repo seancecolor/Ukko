@@ -27,11 +27,12 @@
   let bannerError = '';
   let currentRange = { start: null, end: null };
 
-  // Create Event modal state
-  let showCreateModal = false;
-  let creatingEvent = false;
-  let createError = '';
-  let newEvent = {
+  // Create / Edit Event modal state
+  let showEventModal = false;
+  let editingUid = null;
+  let savingEvent = false;
+  let formError = '';
+  let eventForm = {
     title: '',
     start: '',
     end: '',
@@ -146,6 +147,10 @@
   }
 
   function toLocalInputValue(date) {
+    if (!date) return '';
+    if (typeof date === 'string' && date.length === 10) {
+      return `${date}T09:00`;
+    }
     const d = date instanceof Date ? date : new Date(date);
     if (Number.isNaN(d.getTime())) return '';
     const pad = (n) => String(n).padStart(2, '0');
@@ -194,15 +199,18 @@
   function formatDateTime(value, allDay = false) {
     if (!value) return '';
     if (allDay) {
-      const dateStr = value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+      const dateStr =
+        value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
       const [y, m, d] = dateStr.split('-').map(Number);
       if (y && m && d) {
-        return new Date(y, m - 1, d).toLocaleDateString('en-US', {
-          weekday: 'short',
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric'
-        }) + ' (All day)';
+        return (
+          new Date(y, m - 1, d).toLocaleDateString('en-US', {
+            weekday: 'short',
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric'
+          }) + ' (All day)'
+        );
       }
       return `${dateStr} (All day)`;
     }
@@ -347,7 +355,8 @@
       ? new Date(endDate)
       : new Date(start.getTime() + 60 * 60 * 1000);
 
-    newEvent = {
+    editingUid = null;
+    eventForm = {
       title: '',
       start: toLocalInputValue(start),
       end: toLocalInputValue(end),
@@ -356,31 +365,49 @@
       description: '',
       create_zoom: false
     };
-    createError = '';
-    showCreateModal = true;
+    formError = '';
+    showEventModal = true;
   }
 
-  function closeCreateModal() {
-    if (creatingEvent) return;
-    showCreateModal = false;
-    createError = '';
+  function openEditModal(ev) {
+    if (!ev) return;
+    editingUid = ev.uid;
+    eventForm = {
+      title: ev.title || '',
+      start: toLocalInputValue(ev.start),
+      end: toLocalInputValue(ev.end || ev.start),
+      all_day: Boolean(ev.allDay),
+      location: ev.location || '',
+      description: ev.description || '',
+      create_zoom: false
+    };
+    formError = '';
+    selectedEvent = null;
+    showEventModal = true;
   }
 
-  async function handleCreateEvent(e) {
+  function closeEventModal() {
+    if (savingEvent) return;
+    showEventModal = false;
+    editingUid = null;
+    formError = '';
+  }
+
+  async function handleSaveEvent(e) {
     e.preventDefault();
-    createError = '';
+    formError = '';
 
-    if (!newEvent.title.trim() || !newEvent.start) {
-      createError = 'Title and start time are required.';
+    if (!eventForm.title.trim() || !eventForm.start) {
+      formError = 'Title and start time are required.';
       return;
     }
 
-    creatingEvent = true;
+    savingEvent = true;
 
     try {
-      const isAllDay = Boolean(newEvent.all_day);
-      let startVal = localInputToIso(newEvent.start, isAllDay);
-      let endVal = localInputToIso(newEvent.end || newEvent.start, isAllDay);
+      const isAllDay = Boolean(eventForm.all_day);
+      let startVal = localInputToIso(eventForm.start, isAllDay);
+      let endVal = localInputToIso(eventForm.end || eventForm.start, isAllDay);
 
       if (isAllDay && startVal === endVal) {
         const [y, m, d] = startVal.split('-').map(Number);
@@ -389,16 +416,22 @@
       }
 
       const payload = {
-        title: newEvent.title.trim(),
+        title: eventForm.title.trim(),
         start: startVal,
         end: endVal,
-        location: newEvent.location.trim(),
-        description: newEvent.description.trim(),
-        create_zoom: Boolean(newEvent.create_zoom)
+        location: eventForm.location.trim(),
+        description: eventForm.description.trim(),
+        create_zoom: Boolean(eventForm.create_zoom)
       };
 
-      const res = await fetch('/api/events', {
-        method: 'POST',
+      const isEdit = Boolean(editingUid);
+      const url = isEdit
+        ? `/api/events/${encodeURIComponent(editingUid)}`
+        : '/api/events';
+      const method = isEdit ? 'PUT' : 'POST';
+
+      const res = await fetch(url, {
+        method,
         credentials: 'same-origin',
         headers: authHeaders({
           'Content-Type': 'application/json',
@@ -408,7 +441,8 @@
       });
 
       if (res.status === 401) {
-        showCreateModal = false;
+        showEventModal = false;
+        editingUid = null;
         handleLogout();
         authError = 'Session expired. Please enter your passcode.';
         return;
@@ -416,16 +450,21 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        createError = formatApiError(data, 'Failed to create event.', res.status);
+        formError = formatApiError(
+          data,
+          isEdit ? 'Failed to update event.' : 'Failed to create event.',
+          res.status
+        );
         return;
       }
 
-      showCreateModal = false;
+      showEventModal = false;
+      editingUid = null;
       await fetchEvents();
     } catch (err) {
-      createError = 'Network error while creating event.';
+      formError = 'Network error while saving event.';
     } finally {
-      creatingEvent = false;
+      savingEvent = false;
     }
   }
 
@@ -563,21 +602,7 @@
                 mask="url(#ukko-auth-mark-mask)"
               />
             </svg>
-            <svg class="logo-word-svg" viewBox="0 885 1024 120" role="img" aria-hidden="true">
-              <defs>
-                <mask id="ukko-auth-word-mask">
-                  <image href="/logo.jpg" width="1024" height="1024" />
-                </mask>
-              </defs>
-              <rect
-                x="0"
-                y="0"
-                width="1024"
-                height="1024"
-                fill="currentColor"
-                mask="url(#ukko-auth-word-mask)"
-              />
-            </svg>
+            <span class="logo-wordmark">UKKO <span class="logo-wordmark-accent">CAL</span></span>
           </div>
           <p>Enter your passcode to access your Thundermail calendar.</p>
         </div>
@@ -631,21 +656,7 @@
               mask="url(#ukko-header-mark-mask)"
             />
           </svg>
-          <svg class="logo-word-svg" viewBox="0 885 1024 120" role="img" aria-hidden="true">
-            <defs>
-              <mask id="ukko-header-word-mask">
-                <image href="/logo.jpg" width="1024" height="1024" />
-              </mask>
-            </defs>
-            <rect
-              x="0"
-              y="0"
-              width="1024"
-              height="1024"
-              fill="currentColor"
-              mask="url(#ukko-header-word-mask)"
-            />
-          </svg>
+          <span class="logo-wordmark">UKKO <span class="logo-wordmark-accent">CAL</span></span>
         </div>
         {#if loadingEvents}
           <span class="status-pill">Syncing CalDAV...</span>
@@ -701,37 +712,39 @@
     ></div>
   </main>
 
-  {#if showCreateModal}
-    <div class="modal-backdrop" on:click|self={closeCreateModal} role="presentation">
-      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="create-modal-title">
+  {#if showEventModal}
+    <div class="modal-backdrop" on:click|self={closeEventModal} role="presentation">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="event-modal-title">
         <div class="modal-header">
-          <h2 id="create-modal-title">New Calendar Event</h2>
-          <button type="button" class="close-btn" on:click={closeCreateModal} aria-label="Close">
+          <h2 id="event-modal-title">
+            {editingUid ? 'Edit Calendar Event' : 'New Calendar Event'}
+          </h2>
+          <button type="button" class="close-btn" on:click={closeEventModal} aria-label="Close">
             &times;
           </button>
         </div>
 
-        {#if createError}
-          <div class="alert alert-error">{createError}</div>
+        {#if formError}
+          <div class="alert alert-error">{formError}</div>
         {/if}
 
-        <form on:submit={handleCreateEvent} class="modal-form">
+        <form on:submit={handleSaveEvent} class="modal-form">
           <label class="field">
             <span>Title *</span>
             <input
               type="text"
-              bind:value={newEvent.title}
+              bind:value={eventForm.title}
               placeholder="Team Sync"
               required
-              disabled={creatingEvent}
+              disabled={savingEvent}
             />
           </label>
 
           <label class="checkbox-field">
             <input
               type="checkbox"
-              bind:checked={newEvent.all_day}
-              disabled={creatingEvent}
+              bind:checked={eventForm.all_day}
+              disabled={savingEvent}
             />
             <span>All-day event</span>
           </label>
@@ -741,9 +754,9 @@
               <span>Start *</span>
               <input
                 type="datetime-local"
-                bind:value={newEvent.start}
+                bind:value={eventForm.start}
                 required
-                disabled={creatingEvent}
+                disabled={savingEvent}
               />
             </label>
 
@@ -751,9 +764,9 @@
               <span>End *</span>
               <input
                 type="datetime-local"
-                bind:value={newEvent.end}
+                bind:value={eventForm.end}
                 required
-                disabled={creatingEvent}
+                disabled={savingEvent}
               />
             </label>
           </div>
@@ -761,19 +774,25 @@
           <label class="checkbox-field">
             <input
               type="checkbox"
-              bind:checked={newEvent.create_zoom}
-              disabled={creatingEvent}
+              bind:checked={eventForm.create_zoom}
+              disabled={savingEvent}
             />
-            <span>Automatically create Zoom meeting</span>
+            <span>
+              {editingUid
+                ? 'Generate & attach a new Zoom meeting'
+                : 'Automatically create Zoom meeting'}
+            </span>
           </label>
 
           <label class="field">
-            <span>Location {newEvent.create_zoom ? '(will be replaced with Zoom Join URL)' : ''}</span>
+            <span>
+              Location {eventForm.create_zoom ? '(will be replaced with Zoom Join URL)' : ''}
+            </span>
             <input
               type="text"
-              bind:value={newEvent.location}
-              placeholder={newEvent.create_zoom ? 'Zoom link generated automatically' : 'Room / URL'}
-              disabled={creatingEvent || newEvent.create_zoom}
+              bind:value={eventForm.location}
+              placeholder={eventForm.create_zoom ? 'Zoom link generated automatically' : 'Room / URL'}
+              disabled={savingEvent || eventForm.create_zoom}
             />
           </label>
 
@@ -781,9 +800,9 @@
             <span>Description</span>
             <textarea
               rows="4"
-              bind:value={newEvent.description}
+              bind:value={eventForm.description}
               placeholder="Agenda or notes..."
-              disabled={creatingEvent}
+              disabled={savingEvent}
             ></textarea>
           </label>
 
@@ -791,16 +810,16 @@
             <button
               type="button"
               class="btn btn-secondary"
-              on:click={closeCreateModal}
-              disabled={creatingEvent}
+              on:click={closeEventModal}
+              disabled={savingEvent}
             >
               Cancel
             </button>
-            <button type="submit" class="btn btn-primary" disabled={creatingEvent}>
-              {#if creatingEvent}
-                {newEvent.create_zoom ? 'Creating Zoom & Saving...' : 'Saving...'}
+            <button type="submit" class="btn btn-primary" disabled={savingEvent}>
+              {#if savingEvent}
+                {eventForm.create_zoom ? 'Creating Zoom & Saving...' : 'Saving...'}
               {:else}
-                Save Event
+                {editingUid ? 'Update Event' : 'Save Event'}
               {/if}
             </button>
           </div>
@@ -870,14 +889,24 @@
           >
             {deletingEvent ? 'Deleting...' : 'Delete Event'}
           </button>
-          <button
-            type="button"
-            class="btn btn-secondary"
-            on:click={closeEventDetails}
-            disabled={deletingEvent}
-          >
-            Close
-          </button>
+          <div class="modal-actions-right">
+            <button
+              type="button"
+              class="btn btn-primary"
+              on:click={() => openEditModal(selectedEvent)}
+              disabled={deletingEvent}
+            >
+              Edit Event
+            </button>
+            <button
+              type="button"
+              class="btn btn-secondary"
+              on:click={closeEventDetails}
+              disabled={deletingEvent}
+            >
+              Close
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -922,7 +951,7 @@
   .logo-lockup {
     display: inline-flex;
     align-items: center;
-    gap: 0.65rem;
+    gap: 0.75rem;
     color: var(--text-primary);
     user-select: none;
   }
@@ -934,19 +963,25 @@
     flex-shrink: 0;
   }
 
-  .logo-lockup .logo-word-svg {
-    height: 1.15rem;
-    width: auto;
-    display: block;
-    flex-shrink: 0;
+  .logo-wordmark {
+    font-size: 1.45rem;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+    line-height: 1;
+    color: var(--text-primary);
+    text-transform: uppercase;
+  }
+
+  .logo-wordmark-accent {
+    color: #3b82f6;
   }
 
   .logo-lockup-auth .logo-mark-svg {
     height: 2.6rem;
   }
 
-  .logo-lockup-auth .logo-word-svg {
-    height: 1.25rem;
+  .logo-lockup-auth .logo-wordmark {
+    font-size: 1.55rem;
   }
 
   .container {
@@ -1201,6 +1236,11 @@
 
   .modal-actions-split {
     justify-content: space-between;
+  }
+
+  .modal-actions-right {
+    display: flex;
+    gap: 0.5rem;
   }
 
   .event-details {

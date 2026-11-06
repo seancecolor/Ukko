@@ -26,6 +26,7 @@ defmodule UkkoWeb.Router do
 
     get "/events", EventController, :index
     post "/events", EventController, :create
+    put "/events/:uid", EventController, :update
     delete "/events/:uid", EventController, :delete
   end
 

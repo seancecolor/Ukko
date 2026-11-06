@@ -179,7 +179,11 @@ defmodule Ukko.CalDAV do
     normalized_base =
       if String.ends_with?(base_url, "/"), do: base_url, else: base_url <> "/"
 
-    clean_uid = String.trim_trailing(uid, ".ics")
+    clean_uid =
+      uid
+      |> String.trim_trailing(".ics")
+      |> String.replace("@caldav-import", "_caldav-import")
+
     "#{normalized_base}#{URI.encode(clean_uid)}.ics"
   end
 

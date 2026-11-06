@@ -31,6 +31,18 @@ defmodule UkkoWeb.EventController do
   Accepts `{ title, start, end, description, location, create_zoom: boolean }`.
   """
   def create(conn, params) do
+    save_event(conn, ICal.generate_uid(), params, :created)
+  end
+
+  @doc """
+  PUT /api/events/:uid
+  Updates an existing event on CalDAV (and optionally attaches a Zoom meeting).
+  """
+  def update(conn, %{"uid" => uid} = params) do
+    save_event(conn, uid, params, :ok)
+  end
+
+  defp save_event(conn, uid, params, success_status) do
     title = Map.get(params, "title")
     start_iso = Map.get(params, "start")
     end_iso = Map.get(params, "end") || start_iso
@@ -43,8 +55,6 @@ defmodule UkkoWeb.EventController do
       |> put_status(:bad_request)
       |> json(%{error: "title and start are required"})
     else
-      uid = ICal.generate_uid()
-
       base_attrs = %{
         uid: uid,
         title: String.trim(to_string(title)),
@@ -65,13 +75,14 @@ defmodule UkkoWeb.EventController do
           description: enriched_attrs.description,
           location: enriched_attrs.location,
           extendedProps: %{
+            uid: uid,
             description: enriched_attrs.description,
             location: enriched_attrs.location
           }
         }
 
         conn
-        |> put_status(:created)
+        |> put_status(success_status)
         |> json(event_response)
       else
         {:error, {:zoom_error, reason}} ->
