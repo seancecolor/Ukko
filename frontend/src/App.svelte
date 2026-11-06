@@ -524,6 +524,9 @@
               id: ev.id || ev.uid,
               title: ev.title || '(No Title)',
               allDay,
+              editable: !readOnly,
+              startEditable: !readOnly,
+              durationEditable: !readOnly,
               start: allDay ? String(rawStart).slice(0, 10) : parseTimedDate(rawStart),
               end: allDay ? String(rawEnd).slice(0, 10) : parseTimedDate(rawEnd),
               extendedProps: {
@@ -1138,6 +1141,101 @@
     }
   }
 
+  async function handleEventDropOrResize(info) {
+    const ev = info.event;
+    if (!ev || ev.extendedProps?.readOnly) {
+      info.revert();
+      return;
+    }
+
+    const uid = ev.extendedProps?.uid || ev.id;
+    if (!uid) {
+      info.revert();
+      return;
+    }
+
+    const isAllDay = Boolean(ev.allDay);
+    let startVal;
+    let endVal;
+
+    if (isAllDay) {
+      startVal = toLocalInputValue(ev.start).slice(0, 10);
+      endVal = ev.end ? toLocalInputValue(ev.end).slice(0, 10) : startVal;
+      if (startVal === endVal) {
+        const [y, m, d] = startVal.split('-').map(Number);
+        const nextDay = new Date(Date.UTC(y, m - 1, d + 1));
+        endVal = nextDay.toISOString().slice(0, 10);
+      }
+    } else {
+      startVal =
+        ev.start instanceof Date ? ev.start.toISOString() : new Date(ev.start).toISOString();
+      endVal = ev.end
+        ? ev.end instanceof Date
+          ? ev.end.toISOString()
+          : new Date(ev.end).toISOString()
+        : startVal;
+    }
+
+    const payload = {
+      title: ev.title || '(No Title)',
+      start: startVal,
+      end: endVal,
+      location: ev.extendedProps?.location || '',
+      description: ev.extendedProps?.description || '',
+      create_zoom: false,
+      attendees: Array.isArray(ev.extendedProps?.attendees) ? ev.extendedProps.attendees : []
+    };
+
+    bannerError = '';
+
+    try {
+      const res = await fetch(`/api/events/${encodeURIComponent(uid)}`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        }),
+        body: JSON.stringify(payload)
+      });
+
+      if (res.status === 401) {
+        info.revert();
+        handleLogout();
+        authError = 'Session expired. Please enter your passcode.';
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        info.revert();
+        bannerError = formatApiError(data, 'Failed to update moved event.', res.status);
+        return;
+      }
+
+      events = events.map((item) => {
+        const itemUid = item.extendedProps?.uid || item.id;
+        if (itemUid === uid) {
+          return {
+            ...item,
+            allDay: isAllDay,
+            start: isAllDay ? startVal : new Date(startVal),
+            end: isAllDay ? endVal : new Date(endVal),
+            extendedProps: {
+              ...item.extendedProps,
+              allDay: isAllDay
+            }
+          };
+        }
+        return item;
+      });
+      checkUpcomingNotifications();
+    } catch (err) {
+      info.revert();
+      bannerError = 'Network error while updating moved event.';
+    }
+  }
+
   function openEventDetails(ecEvent) {
     const uid = ecEvent.extendedProps?.uid || ecEvent.id;
     selectedEvent = {
@@ -1505,7 +1603,13 @@
         plugins: [DayGrid, TimeGrid, Interaction],
         options: {
           view: 'timeGridWeek',
+          height: '100%',
+          scrollTime: '08:00:00',
           selectable: true,
+          editable: true,
+          eventStartEditable: true,
+          eventDurationEditable: true,
+          eventResizableFromStart: true,
           nowIndicator: true,
           slotLabelFormat: formatDualSlotLabel,
           allDayContent: createDualSidebarHeader,
@@ -1529,6 +1633,12 @@
           },
           eventClick: (info) => {
             openEventDetails(info.event);
+          },
+          eventDrop: (info) => {
+            handleEventDropOrResize(info);
+          },
+          eventResize: (info) => {
+            handleEventDropOrResize(info);
           }
         }
       }
@@ -2485,15 +2595,19 @@
   .container {
     max-width: 1280px;
     width: 100%;
+    height: 100vh;
+    max-height: 100vh;
+    overflow: hidden;
     margin: 0 auto;
-    padding: 1.25rem 1.5rem;
+    padding: 1rem 1.5rem 1.25rem;
     flex: 1;
     display: flex;
     flex-direction: column;
-    gap: 0.85rem;
+    gap: 0.75rem;
   }
 
   .header {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -2524,6 +2638,7 @@
   }
 
   .calendar-legend {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -2571,7 +2686,11 @@
     border-radius: 0.75rem;
     padding: 1rem;
     box-shadow: var(--shadow-card);
-    flex: 1;
+    flex: 1 1 0%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
   .btn {
