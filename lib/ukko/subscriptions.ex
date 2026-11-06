@@ -10,7 +10,7 @@ defmodule Ukko.Subscriptions do
 
   @table :ukko_subscriptions_cache
   @config_uid "ukko-subscriptions-config"
-  @feed_ttl_seconds 60
+  @feed_ttl_seconds 600
   @default_color "#9333ea"
 
   # --- Client API ---
@@ -136,9 +136,9 @@ defmodule Ukko.Subscriptions do
         fn sub ->
           url = Map.get(sub, "url", "")
 
-          case fetch_remote_ics(url, false) do
-            {:ok, ics_body} ->
-              ICal.parse_vevents(ics_body, start_iso, end_iso, %{
+          case fetch_remote_parsed_calendar(url, false) do
+            {:ok, parsed_cal} ->
+              ICal.expand_parsed_calendar(parsed_cal, start_iso, end_iso, %{
                 color: Map.get(sub, "color", @default_color),
                 calendar_name: Map.get(sub, "name", "Subscribed Calendar"),
                 subscription_id: Map.get(sub, "id"),
@@ -244,7 +244,7 @@ defmodule Ukko.Subscriptions do
       |> Base.url_encode64(padding: false)
 
     :ets.insert(@table, {:feed_token, new_token})
-    save_to_caldav(subs, new_token)
+    save_to_caldav_async(subs, new_token)
     {:reply, {:ok, new_token}, state}
   end
 
@@ -258,7 +258,7 @@ defmodule Ukko.Subscriptions do
       |> Kernel.++([new_sub])
 
     :ets.insert(@table, {:subscriptions, updated})
-    save_to_caldav(updated, token)
+    save_to_caldav_async(updated, token)
     {:reply, {:ok, new_sub}, state}
   end
 
@@ -283,7 +283,7 @@ defmodule Ukko.Subscriptions do
           end)
 
         :ets.insert(@table, {:subscriptions, updated_list})
-        save_to_caldav(updated_list, token)
+        save_to_caldav_async(updated_list, token)
         {:reply, {:ok, updated_sub}, state}
     end
   end
@@ -293,7 +293,7 @@ defmodule Ukko.Subscriptions do
     {current, token} = ensure_loaded()
     updated = Enum.reject(current, fn s -> Map.get(s, "id") == id end)
     :ets.insert(@table, {:subscriptions, updated})
-    save_to_caldav(updated, token)
+    save_to_caldav_async(updated, token)
     {:reply, :ok, state}
   end
 
@@ -365,6 +365,41 @@ defmodule Ukko.Subscriptions do
 
   defp normalize_color(_), do: @default_color
 
+  defp fetch_remote_parsed_calendar(url, bypass_cache) do
+    now = System.system_time(:second)
+
+    cached_parsed =
+      if bypass_cache do
+        nil
+      else
+        case :ets.lookup(@table, {:parsed_feed, url}) do
+          [{{:parsed_feed, ^url}, parsed_cal, expires_at}] when expires_at > now ->
+            parsed_cal
+
+          _ ->
+            nil
+        end
+      end
+
+    if not is_nil(cached_parsed) do
+      {:ok, cached_parsed}
+    else
+      case fetch_remote_ics(url, bypass_cache) do
+        {:ok, ics_str} ->
+          parsed_cal = ICal.parse_calendar_data(ics_str)
+          :ets.insert(@table, {{:parsed_feed, url}, parsed_cal, now + @feed_ttl_seconds})
+          {:ok, parsed_cal}
+
+        {:error, reason} ->
+          # Fallback to stale parsed calendar in ETS if available
+          case :ets.lookup(@table, {:parsed_feed, url}) do
+            [{{:parsed_feed, ^url}, stale_parsed, _}] -> {:ok, stale_parsed}
+            _ -> {:error, reason}
+          end
+      end
+    end
+  end
+
   defp fetch_remote_ics(url, bypass_cache) do
     now = System.system_time(:second)
 
@@ -381,12 +416,14 @@ defmodule Ukko.Subscriptions do
     if is_binary(cached) do
       {:ok, cached}
     else
-      case Req.get(url, decode_body: false, receive_timeout: 15_000) do
+      case Req.get(url, decode_body: false, receive_timeout: 20_000) do
         {:ok, %Req.Response{status: 200, body: body}} ->
           ics_str = to_string(body)
 
           if String.contains?(ics_str, "BEGIN:VCALENDAR") do
+            parsed_cal = ICal.parse_calendar_data(ics_str)
             :ets.insert(@table, {{:feed, url}, ics_str, now + @feed_ttl_seconds})
+            :ets.insert(@table, {{:parsed_feed, url}, parsed_cal, now + @feed_ttl_seconds})
             {:ok, ics_str}
           else
             {:error,
@@ -431,6 +468,14 @@ defmodule Ukko.Subscriptions do
       _ ->
         {[], default_feed_token()}
     end
+  end
+
+  defp save_to_caldav_async(subs, feed_token) do
+    Task.start(fn ->
+      save_to_caldav(subs, feed_token)
+    end)
+
+    :ok
   end
 
   defp save_to_caldav(subs, feed_token) when is_list(subs) and is_binary(feed_token) do

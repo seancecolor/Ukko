@@ -28,17 +28,26 @@ defmodule Ukko.ICal do
   """
   def parse_vevents(ics_text, range_start_iso \\ nil, range_end_iso \\ nil, extra_meta \\ %{})
       when is_binary(ics_text) do
+    ics_text
+    |> parse_calendar_data()
+    |> expand_parsed_calendar(range_start_iso, range_end_iso, extra_meta)
+  end
+
+  @doc """
+  Parses raw `.ics` text once into `{vtimezones, raw_vevents, recurrence_overrides}` so that
+  large subscribed calendars (such as Google Calendar feeds) can be cached in memory and
+  expanded for any date window in milliseconds.
+  """
+  def parse_calendar_data(ics_text) when is_binary(ics_text) do
     unfolded = unfold(ics_text)
     vtimezones = parse_vtimezones(unfolded)
-    {range_start_dt, range_end_dt} = parse_filter_range(range_start_iso, range_end_iso)
 
     raw_vevents =
-      ~r/BEGIN:VEVENT\r?\n(.*?)END:VEVENT/s
-      |> Regex.scan(unfolded, capture: :all_but_first)
-      |> Enum.map(fn [block] -> parse_raw_vevent(block, vtimezones) end)
+      unfolded
+      |> extract_component_blocks("VEVENT")
+      |> Enum.map(fn block -> parse_raw_vevent(block, vtimezones) end)
       |> Enum.reject(&is_nil/1)
 
-    # Collect RECURRENCE-ID dates/UTC timestamps per UID so master RRULEs skip overridden occurrences
     recurrence_overrides =
       Enum.reduce(raw_vevents, %{}, fn ev, acc ->
         case ev.recurrence_id do
@@ -51,12 +60,85 @@ defmodule Ukko.ICal do
         end
       end)
 
+    {vtimezones, raw_vevents, recurrence_overrides}
+  end
+
+  @doc """
+  Expands a pre-parsed `{vtimezones, raw_vevents, recurrence_overrides}` tuple for a target
+  `[range_start_iso, range_end_iso]` window.
+  """
+  def expand_parsed_calendar(
+        {vtimezones, raw_vevents, recurrence_overrides},
+        range_start_iso \\ nil,
+        range_end_iso \\ nil,
+        extra_meta \\ %{}
+      ) do
+    {range_start_dt, range_end_dt} = parse_filter_range(range_start_iso, range_end_iso)
+
     raw_vevents
     |> Enum.flat_map(fn ev ->
-      override_keys = Map.get(recurrence_overrides, ev.uid, MapSet.new())
-      expand_vevent(ev, vtimezones, range_start_dt, range_end_dt, override_keys, extra_meta)
+      if map_size(ev.rrule) == 0 and not single_event_in_rough_range?(ev.dtstart, ev.dtend, range_start_dt, range_end_dt) do
+        []
+      else
+        override_keys = Map.get(recurrence_overrides, ev.uid, MapSet.new())
+        expand_vevent(ev, vtimezones, range_start_dt, range_end_dt, override_keys, extra_meta)
+      end
     end)
     |> filter_by_range(range_start_dt, range_end_dt)
+  end
+
+  defp single_event_in_rough_range?(_dtstart, _dtend, nil, nil), do: true
+
+  defp single_event_in_rough_range?(dtstart, dtend, range_start_dt, range_end_dt) do
+    s_utc = dt_info_to_rough_utc(dtstart, false)
+    e_utc = dt_info_to_rough_utc(dtend || dtstart, true) || s_utc
+
+    after_start =
+      case {range_start_dt, e_utc} do
+        {%DateTime{} = rs, %DateTime{} = ee} ->
+          DateTime.compare(DateTime.add(ee, 86_400, :second), rs) == :gt
+
+        _ ->
+          true
+      end
+
+    before_end =
+      case {range_end_dt, s_utc} do
+        {%DateTime{} = re, %DateTime{} = es} ->
+          DateTime.compare(DateTime.add(es, -86_400, :second), re) == :lt
+
+        _ ->
+          true
+      end
+
+    after_start and before_end
+  end
+
+  defp dt_info_to_rough_utc({:date, %Date{} = d}, is_end) do
+    base = DateTime.new!(d, ~T[00:00:00], "Etc/UTC")
+    if is_end, do: DateTime.add(base, 86_400, :second), else: base
+  end
+
+  defp dt_info_to_rough_utc({_, %DateTime{} = dt, _, _}, _is_end), do: dt
+  defp dt_info_to_rough_utc(_, _), do: nil
+
+  defp extract_component_blocks(text, comp_name) do
+    begin_marker = "BEGIN:" <> comp_name
+    end_marker = "END:" <> comp_name
+
+    case :binary.split(text, begin_marker, [:global]) do
+      [_header] ->
+        []
+
+      [_header | chunks] ->
+        Enum.reduce(chunks, [], fn chunk, acc ->
+          case :binary.split(chunk, end_marker) do
+            [inner | _] -> [inner | acc]
+            _ -> acc
+          end
+        end)
+        |> Enum.reverse()
+    end
   end
 
   @doc """
@@ -116,9 +198,9 @@ defmodule Ukko.ICal do
   # --- VTIMEZONE Parsing & Resolution ---
 
   defp parse_vtimezones(unfolded_ics) do
-    ~r/BEGIN:VTIMEZONE\r?\n(.*?)END:VTIMEZONE/s
-    |> Regex.scan(unfolded_ics, capture: :all_but_first)
-    |> Enum.reduce(%{}, fn [vt_block], acc ->
+    unfolded_ics
+    |> extract_component_blocks("VTIMEZONE")
+    |> Enum.reduce(%{}, fn vt_block, acc ->
       tzid =
         case Regex.run(~r/^TZID(?:;[^:]*)?:(.*)$/m, vt_block, capture: :all_but_first) do
           [raw_tzid] -> clean_tzid(raw_tzid)
@@ -136,10 +218,9 @@ defmodule Ukko.ICal do
   end
 
   defp parse_tz_subblocks(vt_block, tag, kind) do
-    {:ok, regex} = Regex.compile("BEGIN:#{tag}\\r?\\n(.*?)END:#{tag}", "s")
-
-    Regex.scan(regex, vt_block, capture: :all_but_first)
-    |> Enum.map(fn [sub] ->
+    vt_block
+    |> extract_component_blocks(tag)
+    |> Enum.map(fn sub ->
       {props, _} = extract_block_props(sub)
       offset_to = parse_ical_offset(get_prop_raw(props, "TZOFFSETTO") || "+0000")
       offset_from = parse_ical_offset(get_prop_raw(props, "TZOFFSETFROM") || "+0000")
@@ -179,8 +260,7 @@ defmodule Ukko.ICal do
   # --- VEVENT Parsing ---
 
   defp parse_raw_vevent(block, vtimezones) do
-    cleaned_block = String.replace(block, ~r/BEGIN:VALARM.*?END:VALARM\r?\n?/s, "")
-    {props, exdate_props} = extract_block_props(cleaned_block)
+    {props, exdate_props, organizer, attendees} = extract_vevent_all_props(block)
 
     uid = get_prop_text(props, "UID")
     status = String.upcase(get_prop_text(props, "STATUS") || "")
@@ -188,31 +268,29 @@ defmodule Ukko.ICal do
     if is_nil(uid) or uid == @internal_config_uid or status == "CANCELLED" do
       nil
     else
-      summary = get_prop_text(props, "SUMMARY") || "(No Title)"
-      description = get_prop_text(props, "DESCRIPTION") || ""
-      location = get_prop_text(props, "LOCATION") || ""
-      rrule_str = get_prop_raw(props, "RRULE")
-
       dtstart_info = parse_dt_prop(Map.get(props, "DTSTART"), vtimezones)
-      dtend_info = parse_dt_prop(Map.get(props, "DTEND"), vtimezones)
-      duration_sec = parse_duration_seconds(get_prop_raw(props, "DURATION"))
-      recurrence_id = parse_dt_prop(Map.get(props, "RECURRENCE-ID"), vtimezones)
-
-      exdates =
-        exdate_props
-        |> Enum.flat_map(fn {params, val} ->
-          val
-          |> String.split(",", trim: true)
-          |> Enum.map(fn single_val ->
-            parse_dt_prop({params, single_val}, vtimezones)
-          end)
-        end)
-        |> Enum.reject(&is_nil/1)
-        |> Enum.map(&recurrence_match_key/1)
-        |> MapSet.new()
 
       if dtstart_info do
-        {organizer, attendees} = extract_organizer_and_attendees(cleaned_block)
+        summary = get_prop_text(props, "SUMMARY") || "(No Title)"
+        description = get_prop_text(props, "DESCRIPTION") || ""
+        location = get_prop_text(props, "LOCATION") || ""
+        rrule_str = get_prop_raw(props, "RRULE")
+        dtend_info = parse_dt_prop(Map.get(props, "DTEND"), vtimezones)
+        duration_sec = parse_duration_seconds(get_prop_raw(props, "DURATION"))
+        recurrence_id = parse_dt_prop(Map.get(props, "RECURRENCE-ID"), vtimezones)
+
+        exdates =
+          exdate_props
+          |> Enum.flat_map(fn {params, val} ->
+            val
+            |> String.split(",", trim: true)
+            |> Enum.map(fn single_val ->
+              parse_dt_prop({params, single_val}, vtimezones)
+            end)
+          end)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.map(&recurrence_match_key/1)
+          |> MapSet.new()
 
         %{
           uid: uid,
@@ -226,7 +304,7 @@ defmodule Ukko.ICal do
           recurrence_id: recurrence_id,
           exdates: exdates,
           organizer: organizer,
-          attendees: attendees
+          attendees: Enum.reverse(attendees)
         }
       else
         nil
@@ -234,54 +312,56 @@ defmodule Ukko.ICal do
     end
   end
 
-  defp extract_block_props(block) do
+  defp extract_vevent_all_props(block) do
     block
-    |> String.split(~r/\r?\n/, trim: true)
-    |> Enum.reduce({%{}, []}, fn line, {props_acc, exdates_acc} ->
-      case split_prop_line(line) do
-        {key_and_params, value} ->
-          [prop_name | params] = String.split(key_and_params, ";")
-          key = String.upcase(String.trim(prop_name))
+    |> :binary.split(["\r\n", "\n"], [:global, :trim_all])
+    |> Enum.reduce({%{}, [], nil, [], false}, fn line, {props_acc, exdates_acc, org_acc, att_acc, in_alarm} ->
+      trimmed_line = String.trim(line)
 
-          if key == "EXDATE" do
-            {props_acc, [{params, value} | exdates_acc]}
-          else
-            {Map.put_new(props_acc, key, {params, value}), exdates_acc}
-          end
+      cond do
+        trimmed_line == "BEGIN:VALARM" ->
+          {props_acc, exdates_acc, org_acc, att_acc, true}
 
-        :error ->
-          {props_acc, exdates_acc}
-      end
-    end)
-  end
+        trimmed_line == "END:VALARM" ->
+          {props_acc, exdates_acc, org_acc, att_acc, false}
 
-  defp extract_organizer_and_attendees(block) do
-    block
-    |> String.split(~r/\r?\n/, trim: true)
-    |> Enum.reduce({nil, []}, fn line, {org_acc, att_acc} ->
-      case split_prop_line(line) do
-        {key_and_params, value} ->
-          [prop_name | params] = String.split(key_and_params, ";")
-          key = String.upcase(String.trim(prop_name))
+        in_alarm ->
+          {props_acc, exdates_acc, org_acc, att_acc, true}
 
-          cond do
-            key == "ORGANIZER" and is_nil(org_acc) ->
-              {parse_participant(params, value, false), att_acc}
+        true ->
+          case split_prop_line(line) do
+            {key_and_params, value} ->
+              [prop_name | params] = String.split(key_and_params, ";")
+              key = String.upcase(String.trim(prop_name))
 
-            key == "ATTENDEE" ->
-              case parse_participant(params, value, true) do
-                nil -> {org_acc, att_acc}
-                att -> {org_acc, att_acc ++ [att]}
+              cond do
+                key == "EXDATE" ->
+                  {props_acc, [{params, value} | exdates_acc], org_acc, att_acc, false}
+
+                key == "ORGANIZER" and is_nil(org_acc) ->
+                  {props_acc, exdates_acc, parse_participant(params, value, false), att_acc, false}
+
+                key == "ATTENDEE" ->
+                  case parse_participant(params, value, true) do
+                    nil -> {props_acc, exdates_acc, org_acc, att_acc, false}
+                    att -> {props_acc, exdates_acc, org_acc, [att | att_acc], false}
+                  end
+
+                true ->
+                  {Map.put_new(props_acc, key, {params, value}), exdates_acc, org_acc, att_acc, false}
               end
 
-            true ->
-              {org_acc, att_acc}
+            :error ->
+              {props_acc, exdates_acc, org_acc, att_acc, false}
           end
-
-        :error ->
-          {org_acc, att_acc}
       end
     end)
+    |> then(fn {props, exdates, org, atts, _in_alarm} -> {props, exdates, org, atts} end)
+  end
+
+  defp extract_block_props(block) do
+    {props, exdates, _org, _atts} = extract_vevent_all_props(block)
+    {props, exdates}
   end
 
   defp parse_participant(params, raw_value, is_attendee) do
@@ -759,16 +839,25 @@ defmodule Ukko.ICal do
         win_end
       end
 
-    if Date.compare(start_date, eff_end) == :gt do
+    if Date.compare(start_date, eff_end) == :gt or Date.compare(eff_end, win_start) == :lt do
       []
     else
+      has_count = is_integer(max_count) and max_count > 0
+
       raw_dates =
         case freq do
           "DAILY" ->
-            generate_daily_dates(start_date, eff_end, interval)
+            generate_daily_dates(start_date, win_start, eff_end, interval, has_count)
 
           "WEEKLY" ->
-            generate_weekly_dates(start_date, eff_end, interval, Map.get(rrule, "BYDAY"))
+            generate_weekly_dates(
+              start_date,
+              win_start,
+              eff_end,
+              interval,
+              Map.get(rrule, "BYDAY"),
+              has_count
+            )
 
           "MONTHLY" ->
             generate_monthly_dates(start_date, eff_end, interval, rrule)
@@ -781,7 +870,7 @@ defmodule Ukko.ICal do
         end
 
       counted_dates =
-        if is_integer(max_count) and max_count > 0 do
+        if has_count do
           Enum.take(raw_dates, max_count)
         else
           raw_dates
@@ -795,14 +884,21 @@ defmodule Ukko.ICal do
     end
   end
 
-  defp generate_daily_dates(start_date, eff_end, interval) do
-    Stream.iterate(0, &(&1 + 1))
+  defp generate_daily_dates(start_date, win_start, eff_end, interval, has_count) do
+    start_idx =
+      if not has_count and Date.compare(start_date, win_start) == :lt do
+        max(0, div(Date.diff(win_start, start_date), interval) - 1)
+      else
+        0
+      end
+
+    Stream.iterate(start_idx, &(&1 + 1))
     |> Stream.take(2000)
     |> Stream.map(fn i -> Date.add(start_date, i * interval) end)
     |> Enum.take_while(fn d -> Date.compare(d, eff_end) in [:lt, :eq] end)
   end
 
-  defp generate_weekly_dates(start_date, eff_end, interval, byday_str) do
+  defp generate_weekly_dates(start_date, win_start, eff_end, interval, byday_str, has_count) do
     weekdays =
       case byday_str do
         nil ->
@@ -821,7 +917,14 @@ defmodule Ukko.ICal do
     weekdays = if weekdays == [], do: [Date.day_of_week(start_date)], else: weekdays
     start_monday = Date.add(start_date, -(Date.day_of_week(start_date) - 1))
 
-    Stream.iterate(0, &(&1 + 1))
+    start_week_idx =
+      if not has_count and Date.compare(start_monday, win_start) == :lt do
+        max(0, div(Date.diff(win_start, start_monday), interval * 7) - 1)
+      else
+        0
+      end
+
+    Stream.iterate(start_week_idx, &(&1 + 1))
     |> Stream.take(1000)
     |> Stream.flat_map(fn w ->
       week_monday = Date.add(start_monday, w * interval * 7)

@@ -13,7 +13,7 @@ defmodule UkkoWeb.EventController do
     caldav_task = Task.async(fn -> CalDAV.list_events(start_iso, end_iso) end)
     sub_events = Subscriptions.fetch_events(start_iso, end_iso)
 
-    case Task.await(caldav_task, 20_000) do
+    case Task.await(caldav_task, 45_000) do
       {:ok, events} ->
         conn
         |> put_status(:ok)

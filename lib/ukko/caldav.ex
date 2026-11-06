@@ -24,7 +24,11 @@ defmodule Ukko.CalDAV do
                {"content-type", "application/xml; charset=utf-8"}
              ],
              body: xml_body,
-             decode_body: false
+             decode_body: false,
+             receive_timeout: 30_000,
+             connect_options: [timeout: 15_000],
+             retry: :transient,
+             max_retries: 2
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
           events = parse_multistatus_response(to_string(body), start_iso, end_iso)
@@ -60,7 +64,11 @@ defmodule Ukko.CalDAV do
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
              headers: [{"content-type", "text/calendar; charset=utf-8"}],
              body: ics_payload,
-             decode_body: false
+             decode_body: false,
+             receive_timeout: 30_000,
+             connect_options: [timeout: 15_000],
+             retry: :transient,
+             max_retries: 2
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 201, 204] ->
           {:ok, uid}
@@ -85,7 +93,11 @@ defmodule Ukko.CalDAV do
 
       case Req.get(event_url,
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-             decode_body: false
+             decode_body: false,
+             receive_timeout: 20_000,
+             connect_options: [timeout: 10_000],
+             retry: :transient,
+             max_retries: 1
            ) do
         {:ok, %Req.Response{status: 200, body: body}} ->
           {:ok, to_string(body)}
@@ -199,7 +211,11 @@ defmodule Ukko.CalDAV do
                {"content-type", "application/xml; charset=utf-8"}
              ],
              body: xml_body,
-             decode_body: false
+             decode_body: false,
+             receive_timeout: 30_000,
+             connect_options: [timeout: 15_000],
+             retry: :transient,
+             max_retries: 2
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
           {:ok, build_combined_ics(to_string(body))}
