@@ -16,7 +16,7 @@ defmodule Ukko.CalDAV do
       xml_body = build_report_xml(start_iso, end_iso)
 
       case Req.request(
-             method: :report,
+             method: "REPORT",
              url: cfg.url,
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
              headers: [

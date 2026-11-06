@@ -45,6 +45,56 @@
   let deletingEvent = false;
   let deleteError = '';
 
+  const localHourFormatter = new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric'
+  });
+  const localHourMinFormatter = new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+  const estHourFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric'
+  });
+  const estHourMinFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+
+  function getTzAbbreviation(timeZone) {
+    try {
+      const opts = timeZone ? { timeZone, timeZoneName: 'short' } : { timeZoneName: 'short' };
+      const parts = new Intl.DateTimeFormat('en-US', opts).formatToParts(new Date());
+      return parts.find((p) => p.type === 'timeZoneName')?.value || (timeZone ? 'EST' : 'PST');
+    } catch {
+      return timeZone ? 'EST' : 'PST';
+    }
+  }
+
+  const localTzLabel = getTzAbbreviation();
+  const estTzLabel = 'EST';
+
+  function formatDualSlotLabel(date) {
+    const hasMinutes = date.getMinutes() !== 0;
+    const localLabel = hasMinutes
+      ? localHourMinFormatter.format(date)
+      : localHourFormatter.format(date);
+    const estLabel = hasMinutes
+      ? estHourMinFormatter.format(date)
+      : estHourFormatter.format(date);
+
+    return {
+      html: `<span class="tz-dual-slot"><span class="tz-col tz-local">${localLabel}</span><span class="tz-col tz-est">${estLabel}</span></span>`
+    };
+  }
+
+  function createDualSidebarHeader() {
+    return {
+      html: `<span class="tz-header-only tz-dual-slot tz-dual-header"><span class="tz-col tz-local">${localTzLabel}</span><span class="tz-col tz-est">${estTzLabel}</span></span><span class="tz-allday-only">all-day</span>`
+    };
+  }
+
   function initTheme() {
     if (typeof window === 'undefined') return;
     const saved = localStorage.getItem(THEME_KEY);
@@ -116,14 +166,21 @@
     if (!value) return '';
     const d = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(d.getTime())) return String(value);
-    return d.toLocaleString(undefined, {
+    const localStr = d.toLocaleString('en-US', {
       weekday: 'short',
       month: 'short',
       day: 'numeric',
       year: 'numeric',
       hour: 'numeric',
+      minute: '2-digit',
+      timeZoneName: 'short'
+    });
+    const estStr = d.toLocaleTimeString('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
       minute: '2-digit'
     });
+    return `${localStr} (${estStr} EST)`;
   }
 
   function isUrl(str) {
@@ -376,6 +433,8 @@
           view: 'timeGridWeek',
           selectable: true,
           nowIndicator: true,
+          slotLabelFormat: formatDualSlotLabel,
+          allDayContent: createDualSidebarHeader,
           headerToolbar: {
             start: 'prev,next today',
             center: 'title',

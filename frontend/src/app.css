@@ -66,3 +66,64 @@ body {
   display: flex;
   flex-direction: column;
 }
+
+/* Dual Timezone Bar (PST / Local + EST) in @event-calendar/time-grid */
+.ec-time-grid .ec-sidebar {
+  padding: 0 6px;
+}
+
+.ec-time-grid .ec-header .ec-sidebar-title {
+  visibility: visible;
+  height: auto;
+  min-height: 24px;
+  line-height: 24px;
+  overflow: visible;
+}
+
+.ec-time-grid .ec-header .tz-allday-only {
+  display: none;
+}
+
+.ec-time-grid .ec-all-day .tz-header-only,
+.ec-time-grid .ec-body .tz-header-only {
+  display: none;
+}
+
+.ec-time-grid .ec-all-day .ec-sidebar-title {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.tz-dual-slot {
+  display: inline-grid;
+  grid-template-columns: 54px 54px;
+  align-items: center;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 24px;
+}
+
+.tz-dual-header {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tz-dual-slot .tz-col {
+  display: block;
+  text-align: right;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.tz-dual-slot .tz-local {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.tz-dual-slot .tz-est {
+  color: var(--text-muted);
+  border-left: 1px solid var(--border-subtle);
+}
