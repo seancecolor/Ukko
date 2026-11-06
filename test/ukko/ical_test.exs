@@ -1,7 +1,7 @@
 defmodule Ukko.ICalTest do
   use ExUnit.Case, async: true
 
-  alias Ukko.{CalDAV, ICal}
+  alias Ukko.{CalDAV, CardDAV, ICal}
 
   test "builds and parses a VEVENT payload round-trip" do
     uid = ICal.generate_uid()
@@ -92,5 +92,54 @@ defmodule Ukko.ICalTest do
     assert event.end == "2026-11-06T11:00:00Z"
     assert event.description == "Review mockups"
     assert event.location == "Room 101"
+  end
+
+  test "builds and parses VEVENT with organizer and attendees" do
+    uid = ICal.generate_uid()
+
+    ics =
+      ICal.build_ics(%{
+        uid: uid,
+        title: "Product Kickoff",
+        start: "2026-11-07T18:00:00Z",
+        end: "2026-11-07T19:00:00Z",
+        organizer_email: "visitantmedia@thundermail.com",
+        attendees: [
+          %{name: "Nicole", email: "nicole@example.com", status: "ACCEPTED"},
+          %{name: "", email: "partner@example.org", status: "NEEDS-ACTION"}
+        ]
+      })
+
+    assert [event] = ICal.parse_vevents(ics)
+    assert event.organizer == %{name: "", email: "visitantmedia@thundermail.com"}
+
+    assert [
+             %{name: "Nicole", email: "nicole@example.com", status: "ACCEPTED"},
+             %{name: "", email: "partner@example.org", status: "NEEDS-ACTION"}
+           ] = Enum.map(event.attendees, &Map.take(&1, [:name, :email, :status]))
+  end
+
+  test "parses CardDAV multistatus vCard contacts" do
+    xml = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+      <d:response>
+        <d:href>/dav/card/visitantmedia%40thundermail.com/default/c1.vcf</d:href>
+        <d:propstat>
+          <d:prop>
+            <card:address-data>BEGIN:VCARD
+    VERSION:3.0
+    FN:Nicole Visitant
+    EMAIL;TYPE=INTERNET:nicole@example.com
+    END:VCARD</card:address-data>
+          </d:prop>
+          <d:status>HTTP/1.1 200 OK</d:status>
+        </d:propstat>
+      </d:response>
+    </d:multistatus>
+    """
+
+    assert [%{name: "Nicole Visitant", email: "nicole@example.com"}] =
+             CardDAV.parse_multistatus_vcards(xml)
   end
 end

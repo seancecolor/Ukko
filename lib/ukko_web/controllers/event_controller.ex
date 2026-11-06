@@ -1,7 +1,7 @@
 defmodule UkkoWeb.EventController do
   use UkkoWeb, :controller
 
-  alias Ukko.{CalDAV, ICal, Subscriptions, Zoom}
+  alias Ukko.{CalDAV, CardDAV, ICal, Subscriptions, Zoom}
 
   @doc """
   GET /api/events?start=ISO8601&end=ISO8601
@@ -185,12 +185,31 @@ defmodule UkkoWeb.EventController do
     |> json(%{token: token})
   end
 
+  @doc """
+  GET /api/contacts
+  Fetches contacts from the user's Thundermail CardDAV addressbook for attendee autocomplete.
+  """
+  def list_contacts(conn, _params) do
+    case CardDAV.list_contacts() do
+      {:ok, contacts} ->
+        conn
+        |> put_status(:ok)
+        |> json(contacts)
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:ok)
+        |> json([])
+    end
+  end
+
   defp save_event(conn, uid, params, success_status) do
     title = Map.get(params, "title")
     start_iso = Map.get(params, "start")
     end_iso = Map.get(params, "end") || start_iso
     description = Map.get(params, "description") || ""
     location = Map.get(params, "location") || ""
+    attendees = ICal.normalize_attendees(Map.get(params, "attendees") || [])
     create_zoom = truthy?(Map.get(params, "create_zoom", false))
 
     if is_nil(title) or String.trim(to_string(title)) == "" or is_nil(start_iso) do
@@ -204,7 +223,8 @@ defmodule UkkoWeb.EventController do
         start: start_iso,
         end: end_iso,
         description: description,
-        location: location
+        location: location,
+        attendees: attendees
       }
 
       with {:ok, enriched_attrs} <- maybe_attach_zoom(base_attrs, create_zoom),
@@ -217,10 +237,12 @@ defmodule UkkoWeb.EventController do
           end: enriched_attrs.end,
           description: enriched_attrs.description,
           location: enriched_attrs.location,
+          attendees: enriched_attrs.attendees,
           extendedProps: %{
             uid: uid,
             description: enriched_attrs.description,
-            location: enriched_attrs.location
+            location: enriched_attrs.location,
+            attendees: enriched_attrs.attendees
           }
         }
 

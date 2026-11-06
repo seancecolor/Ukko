@@ -3,6 +3,7 @@ import Config
 # Runtime configuration for Ukko (dev & prod)
 config :ukko,
   thundermail_caldav_url: System.get_env("THUNDERMAIL_CALDAV_URL"),
+  thundermail_carddav_url: System.get_env("THUNDERMAIL_CARDDAV_URL"),
   thundermail_user: System.get_env("THUNDERMAIL_USER"),
   thundermail_pass: System.get_env("THUNDERMAIL_PASS"),
   zoom_account_id: System.get_env("ZOOM_ACCOUNT_ID"),

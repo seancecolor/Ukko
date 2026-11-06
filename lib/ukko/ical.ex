@@ -212,6 +212,8 @@ defmodule Ukko.ICal do
         |> MapSet.new()
 
       if dtstart_info do
+        {organizer, attendees} = extract_organizer_and_attendees(cleaned_block)
+
         %{
           uid: uid,
           summary: summary,
@@ -222,7 +224,9 @@ defmodule Ukko.ICal do
           duration_sec: duration_sec,
           rrule: parse_rrule_map(rrule_str),
           recurrence_id: recurrence_id,
-          exdates: exdates
+          exdates: exdates,
+          organizer: organizer,
+          attendees: attendees
         }
       else
         nil
@@ -249,6 +253,77 @@ defmodule Ukko.ICal do
           {props_acc, exdates_acc}
       end
     end)
+  end
+
+  defp extract_organizer_and_attendees(block) do
+    block
+    |> String.split(~r/\r?\n/, trim: true)
+    |> Enum.reduce({nil, []}, fn line, {org_acc, att_acc} ->
+      case split_prop_line(line) do
+        {key_and_params, value} ->
+          [prop_name | params] = String.split(key_and_params, ";")
+          key = String.upcase(String.trim(prop_name))
+
+          cond do
+            key == "ORGANIZER" and is_nil(org_acc) ->
+              {parse_participant(params, value, false), att_acc}
+
+            key == "ATTENDEE" ->
+              case parse_participant(params, value, true) do
+                nil -> {org_acc, att_acc}
+                att -> {org_acc, att_acc ++ [att]}
+              end
+
+            true ->
+              {org_acc, att_acc}
+          end
+
+        :error ->
+          {org_acc, att_acc}
+      end
+    end)
+  end
+
+  defp parse_participant(params, raw_value, is_attendee) do
+    email =
+      raw_value
+      |> String.trim()
+      |> String.replace(~r/^mailto:/i, "")
+      |> String.trim()
+
+    if email == "" or not String.contains?(email, "@") do
+      nil
+    else
+      param_map =
+        Enum.reduce(params, %{}, fn param, acc ->
+          case String.split(param, "=", parts: 2) do
+            [k, v] ->
+              clean_k = String.upcase(String.trim(k))
+              clean_v = v |> String.trim() |> String.trim("\"") |> unescape_text()
+              Map.put(acc, clean_k, clean_v)
+
+            _ ->
+              acc
+          end
+        end)
+
+      cn = Map.get(param_map, "CN") || ""
+      name = if cn == "" or String.downcase(cn) == String.downcase(email), do: "", else: cn
+
+      if is_attendee do
+        %{
+          name: name,
+          email: email,
+          status: Map.get(param_map, "PARTSTAT") || "NEEDS-ACTION",
+          role: Map.get(param_map, "ROLE") || "REQ-PARTICIPANT"
+        }
+      else
+        %{
+          name: name,
+          email: email
+        }
+      end
+    end
   end
 
   defp parse_dt_prop(nil, _vtimezones), do: nil
@@ -825,6 +900,8 @@ defmodule Ukko.ICal do
       allDay: all_day,
       description: ev.description,
       location: ev.location,
+      organizer: Map.get(ev, :organizer),
+      attendees: Map.get(ev, :attendees, []),
       readOnly: read_only,
       calendarName: calendar_name,
       subscriptionId: sub_id,
@@ -832,6 +909,8 @@ defmodule Ukko.ICal do
         uid: ev.uid,
         description: ev.description,
         location: ev.location,
+        organizer: Map.get(ev, :organizer),
+        attendees: Map.get(ev, :attendees, []),
         readOnly: read_only,
         calendarName: calendar_name,
         subscriptionId: sub_id,
@@ -1130,33 +1209,127 @@ defmodule Ukko.ICal do
 
   @doc """
   Builds an RFC 5545 `.ics` VCALENDAR string for a single event.
+  Supports optional `:attendees` (list of `%{name, email, status}` maps or email strings)
+  and `:organizer_email`.
   """
   def build_ics(%{uid: uid, title: title, start: start_iso, end: end_iso} = attrs) do
     description = Map.get(attrs, :description) || ""
     location = Map.get(attrs, :location) || ""
+    attendees = normalize_attendees(Map.get(attrs, :attendees) || [])
+    organizer_email =
+      Map.get(attrs, :organizer_email) ||
+        Application.get_env(:ukko, :thundermail_user) ||
+        ""
+
     dtstamp = iso8601_to_ical_utc(DateTime.utc_now())
     dtstart = format_dt_prop("DTSTART", start_iso)
     dtend = format_dt_prop("DTEND", end_iso || start_iso)
 
-    lines = [
-      "BEGIN:VCALENDAR",
-      "VERSION:2.0",
-      "PRODID:-//Ukko//CalDAV Client//EN",
-      "CALSCALE:GREGORIAN",
-      "BEGIN:VEVENT",
-      "UID:#{uid}",
-      "DTSTAMP:#{dtstamp}",
-      dtstart,
-      dtend,
-      "SUMMARY:#{escape_text(title || "Untitled Event")}",
-      "DESCRIPTION:#{escape_text(description)}",
-      "LOCATION:#{escape_text(location)}",
-      "END:VEVENT",
-      "END:VCALENDAR",
-      ""
-    ]
+    participant_lines = build_participant_lines(organizer_email, attendees)
+
+    lines =
+      [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Ukko//CalDAV Client//EN",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        "UID:#{uid}",
+        "DTSTAMP:#{dtstamp}",
+        dtstart,
+        dtend,
+        "SUMMARY:#{escape_text(title || "Untitled Event")}",
+        "DESCRIPTION:#{escape_text(description)}",
+        "LOCATION:#{escape_text(location)}"
+      ] ++
+        participant_lines ++
+        [
+          "END:VEVENT",
+          "END:VCALENDAR",
+          ""
+        ]
 
     Enum.join(lines, "\r\n")
+  end
+
+  @doc """
+  Normalizes a list of attendee maps or strings into `%{name: String.t(), email: String.t(), status: String.t()}` maps.
+  """
+  def normalize_attendees(list) when is_list(list) do
+    list
+    |> Enum.map(fn
+      att when is_map(att) ->
+        email =
+          (att[:email] || att["email"] || "")
+          |> to_string()
+          |> String.trim()
+          |> String.replace(~r/^mailto:/i, "")
+
+        name =
+          (att[:name] || att["name"] || "")
+          |> to_string()
+          |> String.trim()
+
+        status =
+          (att[:status] || att["status"] || "NEEDS-ACTION")
+          |> to_string()
+          |> String.upcase()
+          |> String.trim()
+
+        %{name: name, email: email, status: if(status == "", do: "NEEDS-ACTION", else: status)}
+
+      att when is_binary(att) ->
+        trimmed = String.trim(att)
+
+        case Regex.run(~r/^(.*)<([^>]+)>$/, trimmed, capture: :all_but_first) do
+          [name_part, email_part] ->
+            %{
+              name: String.trim(name_part, " \""),
+              email: String.trim(email_part),
+              status: "NEEDS-ACTION"
+            }
+
+          _ ->
+            %{name: "", email: trimmed, status: "NEEDS-ACTION"}
+        end
+
+      _ ->
+        %{name: "", email: "", status: "NEEDS-ACTION"}
+    end)
+    |> Enum.filter(fn %{email: email} -> email != "" and String.contains?(email, "@") end)
+    |> Enum.uniq_by(fn %{email: email} -> String.downcase(email) end)
+  end
+
+  def normalize_attendees(_), do: []
+
+  defp build_participant_lines(_organizer_email, []), do: []
+
+  defp build_participant_lines(organizer_email, attendees) do
+    org_trimmed = String.trim(to_string(organizer_email))
+
+    organizer_lines =
+      if org_trimmed != "" and String.contains?(org_trimmed, "@") do
+        ["ORGANIZER:mailto:#{org_trimmed}"]
+      else
+        []
+      end
+
+    attendee_lines =
+      Enum.map(attendees, fn %{name: name, email: email, status: status} ->
+        cn_param =
+          if is_binary(name) and String.trim(name) != "" do
+            safe_cn = String.replace(String.trim(name), "\"", "'")
+            ~s(;CN="#{safe_cn}")
+          else
+            ""
+          end
+
+        partstat = if is_binary(status) and status != "", do: status, else: "NEEDS-ACTION"
+
+        "ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=#{partstat};RSVP=TRUE#{cn_param}:mailto:#{email}"
+      end)
+
+    organizer_lines ++ attendee_lines
   end
 
   defp format_dt_prop(prop, iso) when is_binary(iso) do

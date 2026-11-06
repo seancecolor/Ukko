@@ -73,6 +73,15 @@
       ? `${window.location.origin}/api/feed/${feedToken}/ukko.ics`
       : '';
 
+  // App version state
+  let appVersion = '0.1.2';
+
+  // CardDAV contacts & attendee autocomplete state
+  let contacts = [];
+  let attendeeQuery = '';
+  let attendeeDropdownOpen = false;
+  let attendeeHighlightIndex = 0;
+
   // Create / Edit Event modal state
   let showEventModal = false;
   let editingUid = null;
@@ -85,9 +94,62 @@
     all_day: false,
     location: '',
     description: '',
-    create_zoom: false
+    create_zoom: false,
+    attendees: []
   };
 
+  $: allKnownContacts = (() => {
+    const map = new Map();
+    for (const c of contacts) {
+      if (c?.email) {
+        map.set(c.email.toLowerCase(), {
+          name: c.name || '',
+          email: c.email
+        });
+      }
+    }
+    for (const ev of events) {
+      const org = ev?.extendedProps?.organizer;
+      if (org?.email) {
+        const key = org.email.toLowerCase();
+        if (!map.has(key) || (!map.get(key).name && org.name)) {
+          map.set(key, { name: org.name || '', email: org.email });
+        }
+      }
+      const atts = ev?.extendedProps?.attendees || [];
+      for (const a of atts) {
+        if (a?.email) {
+          const key = a.email.toLowerCase();
+          if (!map.has(key) || (!map.get(key).name && a.name)) {
+            map.set(key, { name: a.name || '', email: a.email });
+          }
+        }
+      }
+    }
+    return Array.from(map.values()).sort((a, b) =>
+      (a.name || a.email).localeCompare(b.name || b.email)
+    );
+  })();
+
+  $: filteredContactSuggestions = (() => {
+    const q = attendeeQuery.trim().toLowerCase();
+    const selectedEmails = new Set(
+      (eventForm.attendees || []).map((a) => (a.email || '').toLowerCase())
+    );
+    const available = allKnownContacts.filter(
+      (c) => !selectedEmails.has(c.email.toLowerCase())
+    );
+    if (!q) {
+      return available.slice(0, 6);
+    }
+    return available
+      .filter(
+        (c) =>
+          (c.name && c.name.toLowerCase().includes(q)) ||
+          c.email.toLowerCase().includes(q)
+      )
+      .slice(0, 6);
+  })();
   // Event Details / Delete modal state
   let selectedEvent = null;
   let deletingEvent = false;
@@ -318,6 +380,7 @@
       await tick();
       initCalendar();
       fetchSubscriptions();
+      fetchContacts();
       startNotificationTimers();
     } catch (err) {
       authError = 'Could not reach server. Please try again.';
@@ -388,6 +451,12 @@
                 allDay,
                 description: ev.description ?? ev.extendedProps?.description ?? '',
                 location: ev.location ?? ev.extendedProps?.location ?? '',
+                organizer: ev.organizer ?? ev.extendedProps?.organizer ?? null,
+                attendees: Array.isArray(ev.attendees)
+                  ? ev.attendees
+                  : Array.isArray(ev.extendedProps?.attendees)
+                    ? ev.extendedProps.attendees
+                    : [],
                 readOnly,
                 calendarName,
                 color: bgColor || '#2563eb'
@@ -662,6 +731,186 @@
     }
   }
 
+  async function fetchAppVersion() {
+    try {
+      const res = await fetch('/api/health', { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data.version) {
+          appVersion = data.version;
+        }
+      }
+    } catch {
+      // keep default version
+    }
+  }
+
+  async function fetchContacts() {
+    if (!authenticated) return;
+    try {
+      const res = await fetch('/api/contacts', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => []);
+        if (Array.isArray(data)) {
+          contacts = data;
+        }
+      }
+    } catch {
+      // ignore background error
+    }
+  }
+
+  function parseTypedAttendee(inputStr) {
+    const trimmed = (inputStr || '').trim();
+    if (!trimmed) return null;
+
+    const angleMatch = trimmed.match(/^(.*)<([^>]+)>$/);
+    if (angleMatch) {
+      const name = angleMatch[1].trim().replace(/^["']|["']$/g, '');
+      const email = angleMatch[2].trim();
+      if (email.includes('@')) {
+        return { name, email, status: 'NEEDS-ACTION' };
+      }
+    }
+
+    if (trimmed.includes('@') && !trimmed.includes(' ')) {
+      const known = allKnownContacts.find(
+        (c) => c.email.toLowerCase() === trimmed.toLowerCase()
+      );
+      return {
+        name: known?.name || '',
+        email: trimmed,
+        status: 'NEEDS-ACTION'
+      };
+    }
+
+    return null;
+  }
+
+  function addAttendee(contactOrTyped) {
+    if (!contactOrTyped || !contactOrTyped.email) return false;
+    const emailLower = contactOrTyped.email.trim().toLowerCase();
+    if (!emailLower.includes('@')) return false;
+
+    const current = eventForm.attendees || [];
+    if (current.some((a) => (a.email || '').toLowerCase() === emailLower)) {
+      attendeeQuery = '';
+      attendeeDropdownOpen = false;
+      return true;
+    }
+
+    eventForm = {
+      ...eventForm,
+      attendees: [
+        ...current,
+        {
+          name: contactOrTyped.name || '',
+          email: contactOrTyped.email.trim(),
+          status: contactOrTyped.status || 'NEEDS-ACTION'
+        }
+      ]
+    };
+    attendeeQuery = '';
+    attendeeHighlightIndex = 0;
+    attendeeDropdownOpen = false;
+    return true;
+  }
+
+  function handleAddTypedAttendee() {
+    if (!attendeeQuery.trim()) return;
+    const parts = attendeeQuery
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    let addedAny = false;
+    for (const part of parts) {
+      const parsed = parseTypedAttendee(part);
+      if (parsed) {
+        addAttendee(parsed);
+        addedAny = true;
+      } else if (filteredContactSuggestions.length > 0) {
+        const pick =
+          filteredContactSuggestions[attendeeHighlightIndex] ||
+          filteredContactSuggestions[0];
+        if (pick) {
+          addAttendee(pick);
+          addedAny = true;
+        }
+      }
+    }
+
+    if (!addedAny && attendeeQuery.trim()) {
+      formError = 'Please enter a valid email address (e.g. name@example.com) or select a contact.';
+    } else {
+      formError = '';
+    }
+  }
+
+  function handleAttendeeKeydown(e) {
+    if (e.key === 'ArrowDown') {
+      if (filteredContactSuggestions.length > 0) {
+        e.preventDefault();
+        attendeeDropdownOpen = true;
+        attendeeHighlightIndex =
+          (attendeeHighlightIndex + 1) % filteredContactSuggestions.length;
+      }
+    } else if (e.key === 'ArrowUp') {
+      if (filteredContactSuggestions.length > 0) {
+        e.preventDefault();
+        attendeeDropdownOpen = true;
+        attendeeHighlightIndex =
+          (attendeeHighlightIndex - 1 + filteredContactSuggestions.length) %
+          filteredContactSuggestions.length;
+      }
+    } else if (e.key === 'Enter' || e.key === ',') {
+      if (attendeeQuery.trim()) {
+        e.preventDefault();
+        if (
+          attendeeDropdownOpen &&
+          filteredContactSuggestions.length > 0 &&
+          !attendeeQuery.includes('@')
+        ) {
+          const pick =
+            filteredContactSuggestions[attendeeHighlightIndex] ||
+            filteredContactSuggestions[0];
+          addAttendee(pick);
+        } else {
+          handleAddTypedAttendee();
+        }
+      }
+    } else if (e.key === 'Escape') {
+      attendeeDropdownOpen = false;
+    } else if (
+      e.key === 'Backspace' &&
+      !attendeeQuery &&
+      eventForm.attendees?.length > 0
+    ) {
+      removeAttendee(eventForm.attendees[eventForm.attendees.length - 1].email);
+    }
+  }
+
+  function removeAttendee(email) {
+    eventForm = {
+      ...eventForm,
+      attendees: (eventForm.attendees || []).filter(
+        (a) => (a.email || '').toLowerCase() !== (email || '').toLowerCase()
+      )
+    };
+  }
+
+  function formatAttendeeStatus(status) {
+    const s = (status || 'NEEDS-ACTION').toUpperCase();
+    if (s === 'ACCEPTED') return 'Accepted';
+    if (s === 'DECLINED') return 'Declined';
+    if (s === 'TENTATIVE') return 'Tentative';
+    return 'Invited';
+  }
+
   // --- Create / Edit / Delete Events ---
 
   function openCreateModal(startDate, endDate, allDay = false) {
@@ -675,6 +924,9 @@
       : new Date(start.getTime() + 60 * 60 * 1000);
 
     editingUid = null;
+    attendeeQuery = '';
+    attendeeDropdownOpen = false;
+    attendeeHighlightIndex = 0;
     eventForm = {
       title: '',
       start: toLocalInputValue(start),
@@ -682,15 +934,22 @@
       all_day: Boolean(allDay),
       location: '',
       description: '',
-      create_zoom: false
+      create_zoom: false,
+      attendees: []
     };
     formError = '';
     showEventModal = true;
+    if (contacts.length === 0) {
+      fetchContacts();
+    }
   }
 
   function openEditModal(ev) {
     if (!ev || ev.readOnly) return;
     editingUid = ev.uid;
+    attendeeQuery = '';
+    attendeeDropdownOpen = false;
+    attendeeHighlightIndex = 0;
     eventForm = {
       title: ev.title || '',
       start: toLocalInputValue(ev.start),
@@ -698,11 +957,15 @@
       all_day: Boolean(ev.allDay),
       location: ev.location || '',
       description: ev.description || '',
-      create_zoom: false
+      create_zoom: false,
+      attendees: Array.isArray(ev.attendees) ? [...ev.attendees] : []
     };
     formError = '';
     selectedEvent = null;
     showEventModal = true;
+    if (contacts.length === 0) {
+      fetchContacts();
+    }
   }
 
   function closeEventModal() {
@@ -734,13 +997,21 @@
         endVal = nextDay.toISOString().slice(0, 10);
       }
 
+      if (attendeeQuery.trim()) {
+        const pending = parseTypedAttendee(attendeeQuery.trim());
+        if (pending) {
+          addAttendee(pending);
+        }
+      }
+
       const payload = {
         title: eventForm.title.trim(),
         start: startVal,
         end: endVal,
         location: eventForm.location.trim(),
         description: eventForm.description.trim(),
-        create_zoom: Boolean(eventForm.create_zoom)
+        create_zoom: Boolean(eventForm.create_zoom),
+        attendees: eventForm.attendees || []
       };
 
       const isEdit = Boolean(editingUid);
@@ -797,6 +1068,10 @@
       end: ecEvent.end,
       location: ecEvent.extendedProps?.location || '',
       description: ecEvent.extendedProps?.description || '',
+      organizer: ecEvent.extendedProps?.organizer || null,
+      attendees: Array.isArray(ecEvent.extendedProps?.attendees)
+        ? ecEvent.extendedProps.attendees
+        : [],
       readOnly: Boolean(ecEvent.extendedProps?.readOnly),
       calendarName: ecEvent.extendedProps?.calendarName || 'Ukko Calendar',
       color: ecEvent.extendedProps?.color || '#2563eb'
@@ -1186,9 +1461,11 @@
   onMount(() => {
     initTheme();
     initNotifications();
+    fetchAppVersion();
     if (authenticated) {
       initCalendar();
       fetchSubscriptions();
+      fetchContacts();
       startNotificationTimers();
     }
   });
@@ -1645,6 +1922,96 @@
             />
           </label>
 
+          <div class="field attendee-field">
+            <span>
+              Invite People
+              {#if allKnownContacts.length > 0}
+                <small class="field-hint">
+                  ({allKnownContacts.length} Thundermail CardDAV / calendar contact{allKnownContacts.length === 1 ? '' : 's'} available)
+                </small>
+              {/if}
+            </span>
+
+            {#if eventForm.attendees && eventForm.attendees.length > 0}
+              <div class="attendee-chips">
+                {#each eventForm.attendees as att (att.email)}
+                  <span class="attendee-chip">
+                    <span class="attendee-chip-label">
+                      {#if att.name}
+                        <strong>{att.name}</strong> &lt;{att.email}&gt;
+                      {:else}
+                        {att.email}
+                      {/if}
+                    </span>
+                    <button
+                      type="button"
+                      class="attendee-chip-remove"
+                      on:click={() => removeAttendee(att.email)}
+                      disabled={savingEvent}
+                      aria-label="Remove {att.email}"
+                    >
+                      &times;
+                    </button>
+                  </span>
+                {/each}
+              </div>
+            {/if}
+
+            <div class="attendee-input-wrapper">
+              <div class="attendee-input-row">
+                <input
+                  type="text"
+                  bind:value={attendeeQuery}
+                  on:focus={() => {
+                    attendeeDropdownOpen = true;
+                    attendeeHighlightIndex = 0;
+                  }}
+                  on:input={() => {
+                    attendeeDropdownOpen = true;
+                    attendeeHighlightIndex = 0;
+                  }}
+                  on:blur={() => {
+                    setTimeout(() => {
+                      attendeeDropdownOpen = false;
+                    }, 160);
+                  }}
+                  on:keydown={handleAttendeeKeydown}
+                  placeholder="Type name or email (press Enter or Add)..."
+                  disabled={savingEvent}
+                  autocomplete="off"
+                />
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  on:click={handleAddTypedAttendee}
+                  disabled={savingEvent || !attendeeQuery.trim()}
+                >
+                  + Add
+                </button>
+              </div>
+
+              {#if attendeeDropdownOpen && filteredContactSuggestions.length > 0}
+                <ul class="contact-suggestions" role="listbox">
+                  {#each filteredContactSuggestions as contact, idx (contact.email)}
+                    <li>
+                      <button
+                        type="button"
+                        class="contact-suggestion-btn"
+                        class:contact-suggestion-active={idx === attendeeHighlightIndex}
+                        on:mousedown|preventDefault={() => addAttendee(contact)}
+                      >
+                        <span class="contact-suggestion-name">
+                          {contact.name || contact.email}
+                        </span>
+                        <span class="contact-suggestion-email">{contact.email}</span>
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+          </div>
+
           <label class="field">
             <span>Description</span>
             <textarea
@@ -1727,6 +2094,44 @@
               {:else}
                 <span>{selectedEvent.location}</span>
               {/if}
+            </div>
+          {/if}
+
+          {#if selectedEvent.organizer && selectedEvent.organizer.email}
+            <div class="detail-row">
+              <strong>Organizer:</strong>
+              <span>
+                {#if selectedEvent.organizer.name}
+                  {selectedEvent.organizer.name} ({selectedEvent.organizer.email})
+                {:else}
+                  {selectedEvent.organizer.email}
+                {/if}
+              </span>
+            </div>
+          {/if}
+
+          {#if selectedEvent.attendees && selectedEvent.attendees.length > 0}
+            <div class="detail-attendees">
+              <strong>Attendees ({selectedEvent.attendees.length}):</strong>
+              <ul class="detail-attendee-list">
+                {#each selectedEvent.attendees as att (att.email)}
+                  <li class="detail-attendee-item">
+                    <div class="detail-attendee-info">
+                      {#if att.name}
+                        <span class="detail-attendee-name">{att.name}</span>
+                        <span class="detail-attendee-email">&lt;{att.email}&gt;</span>
+                      {:else}
+                        <span class="detail-attendee-name">{att.email}</span>
+                      {/if}
+                    </div>
+                    <span
+                      class="attendee-status-badge status-{(att.status || 'NEEDS-ACTION').toLowerCase()}"
+                    >
+                      {formatAttendeeStatus(att.status)}
+                    </span>
+                  </li>
+                {/each}
+              </ul>
             </div>
           {/if}
 
@@ -1888,6 +2293,10 @@
     </div>
   {/if}
 {/if}
+
+<div class="version-corner" aria-label="Application version">
+  v{appVersion}
+</div>
 
 <style>
   .sr-only-input {
@@ -2500,5 +2909,203 @@
     font-family: inherit;
     font-size: 0.875rem;
     color: var(--text-secondary);
+  }
+
+  .field-hint {
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    margin-left: 0.25rem;
+  }
+
+  .attendee-field {
+    position: relative;
+  }
+
+  .attendee-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 0.2rem;
+  }
+
+  .attendee-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.22rem 0.55rem;
+    border-radius: 999px;
+    background: var(--pill-bg);
+    color: var(--pill-text);
+    font-size: 0.78rem;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .attendee-chip-remove {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 0.95rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 0.1rem;
+    opacity: 0.75;
+  }
+
+  .attendee-chip-remove:hover {
+    opacity: 1;
+  }
+
+  .attendee-input-wrapper {
+    position: relative;
+  }
+
+  .attendee-input-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .attendee-input-row input {
+    flex: 1;
+  }
+
+  .contact-suggestions {
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    left: 0;
+    right: 0;
+    margin: 0;
+    padding: 0.3rem;
+    list-style: none;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-modal);
+    z-index: 30;
+    max-height: 210px;
+    overflow-y: auto;
+  }
+
+  .contact-suggestion-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.45rem 0.6rem;
+    border: none;
+    border-radius: 0.375rem;
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+    font-size: 0.84rem;
+  }
+
+  .contact-suggestion-btn:hover,
+  .contact-suggestion-active {
+    background: var(--bg-subtle);
+  }
+
+  .contact-suggestion-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .contact-suggestion-email {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .detail-attendees {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .detail-attendee-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .detail-attendee-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.4rem 0.65rem;
+    border-radius: 0.45rem;
+    background: var(--bg-page);
+    border: 1px solid var(--border-subtle);
+    font-size: 0.84rem;
+  }
+
+  .detail-attendee-info {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .detail-attendee-name {
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .detail-attendee-email {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+  }
+
+  .attendee-status-badge {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.12rem 0.5rem;
+    border-radius: 999px;
+    background: var(--bg-subtle);
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .status-accepted {
+    background: rgba(16, 185, 129, 0.16);
+    color: #10b981;
+  }
+
+  .status-declined {
+    background: rgba(239, 68, 68, 0.16);
+    color: #ef4444;
+  }
+
+  .status-tentative {
+    background: rgba(245, 158, 11, 0.16);
+    color: #f59e0b;
+  }
+
+  .version-corner {
+    position: fixed;
+    bottom: 0.65rem;
+    right: 0.85rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    padding: 0.18rem 0.55rem;
+    border-radius: 999px;
+    opacity: 0.75;
+    pointer-events: none;
+    z-index: 50;
   }
 </style>
