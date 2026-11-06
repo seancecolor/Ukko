@@ -4,7 +4,7 @@ defmodule Ukko.MixProject do
   def project do
     [
       app: :ukko,
-      version: "0.1.2",
+      version: "0.1.4",
       elixir: "~> 1.15",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
