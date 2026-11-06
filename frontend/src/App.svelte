@@ -9,6 +9,15 @@
   const TOKEN_KEY = 'ukko_auth_token';
   const THEME_KEY = 'ukko_theme';
 
+  const SUBSCRIPTION_COLORS = [
+    { name: 'Purple', value: '#9333ea' },
+    { name: 'Pink', value: '#db2777' },
+    { name: 'Emerald', value: '#059669' },
+    { name: 'Amber', value: '#d97706' },
+    { name: 'Rose', value: '#e11d48' },
+    { name: 'Cyan', value: '#0891b2' }
+  ];
+
   // Theme state
   let darkMode = false;
 
@@ -25,7 +34,23 @@
   let events = [];
   let loadingEvents = false;
   let bannerError = '';
+  let bannerSuccess = '';
   let currentRange = { start: null, end: null };
+
+  // .ics file import state
+  let icsFileInput;
+  let importingIcs = false;
+
+  // Subscribed calendars state
+  let subscriptions = [];
+  let showSubscriptionsModal = false;
+  let subSaving = false;
+  let subError = '';
+  let subForm = {
+    name: '',
+    url: '',
+    color: '#9333ea'
+  };
 
   // Create / Edit Event modal state
   let showEventModal = false;
@@ -175,16 +200,7 @@
   function isEventAllDay(ev) {
     if (ev.allDay === true) return true;
     const s = typeof ev.start === 'string' ? ev.start.trim() : '';
-    const e = typeof ev.end === 'string' ? ev.end.trim() : s;
-    if (s.length === 10) return true;
-    if (
-      s !== e &&
-      (s.endsWith('T00:00:00Z') || s.endsWith('T00:00:00')) &&
-      (e.endsWith('T00:00:00Z') || e.endsWith('T00:00:00'))
-    ) {
-      return true;
-    }
-    return false;
+    return s.length === 10;
   }
 
   function parseTimedDate(val) {
@@ -266,6 +282,7 @@
       passcode = '';
       await tick();
       initCalendar();
+      fetchSubscriptions();
     } catch (err) {
       authError = 'Could not reach server. Please try again.';
     } finally {
@@ -318,8 +335,12 @@
             const allDay = isEventAllDay(ev);
             const rawStart = ev.start;
             const rawEnd = ev.end || ev.start;
+            const bgColor = ev.backgroundColor || ev.color || ev.extendedProps?.color;
+            const readOnly = Boolean(ev.readOnly || ev.extendedProps?.readOnly);
+            const calendarName =
+              ev.calendarName || ev.extendedProps?.calendarName || 'Ukko Calendar';
 
-            return {
+            const mapped = {
               id: ev.id || ev.uid,
               title: ev.title || '(No Title)',
               allDay,
@@ -329,9 +350,19 @@
                 uid: ev.uid || ev.id,
                 allDay,
                 description: ev.description ?? ev.extendedProps?.description ?? '',
-                location: ev.location ?? ev.extendedProps?.location ?? ''
+                location: ev.location ?? ev.extendedProps?.location ?? '',
+                readOnly,
+                calendarName,
+                color: bgColor || '#2563eb'
               }
             };
+
+            if (bgColor) {
+              mapped.backgroundColor = bgColor;
+              mapped.color = bgColor;
+            }
+
+            return mapped;
           })
         : [];
 
@@ -344,6 +375,199 @@
       loadingEvents = false;
     }
   }
+
+  // --- .ics Import ---
+
+  function triggerIcsImport() {
+    if (icsFileInput) {
+      icsFileInput.value = '';
+      icsFileInput.click();
+    }
+  }
+
+  async function handleIcsFileSelected(e) {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+
+    importingIcs = true;
+    bannerError = '';
+    bannerSuccess = '';
+
+    try {
+      const icsList = await Promise.all(files.map((file) => file.text()));
+      const res = await fetch('/api/events/import', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        }),
+        body: JSON.stringify({ ics_list: icsList })
+      });
+
+      if (res.status === 401) {
+        handleLogout();
+        authError = 'Session expired. Please enter your passcode.';
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        bannerError = formatApiError(data, 'Failed to import .ics file.', res.status);
+        return;
+      }
+
+      const count = data.imported || 1;
+      bannerSuccess = `Successfully imported ${count} event${count === 1 ? '' : 's'} from .ics file.`;
+      await fetchEvents();
+    } catch (err) {
+      bannerError = 'Failed to read or upload .ics file.';
+    } finally {
+      importingIcs = false;
+    }
+  }
+
+  // --- Subscribed Calendars (Google Calendar / iCal) ---
+
+  async function fetchSubscriptions() {
+    if (!authenticated) return;
+    try {
+      const res = await fetch('/api/subscriptions', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => []);
+        if (Array.isArray(data)) {
+          subscriptions = data;
+        }
+      }
+    } catch {
+      // ignore background error
+    }
+  }
+
+  function openSubscriptionsModal() {
+    subError = '';
+    subForm = {
+      name: '',
+      url: '',
+      color: SUBSCRIPTION_COLORS[subscriptions.length % SUBSCRIPTION_COLORS.length].value
+    };
+    showSubscriptionsModal = true;
+    fetchSubscriptions();
+  }
+
+  function closeSubscriptionsModal() {
+    if (subSaving) return;
+    showSubscriptionsModal = false;
+    subError = '';
+  }
+
+  async function handleAddSubscription(e) {
+    e.preventDefault();
+    subError = '';
+
+    if (!subForm.url.trim()) {
+      subError = 'Please enter a Google Calendar or iCal (.ics) URL.';
+      return;
+    }
+
+    subSaving = true;
+
+    try {
+      const res = await fetch('/api/subscriptions', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        }),
+        body: JSON.stringify({
+          name: subForm.name.trim(),
+          url: subForm.url.trim(),
+          color: subForm.color
+        })
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        subError = formatApiError(data, 'Failed to subscribe to calendar.', res.status);
+        return;
+      }
+
+      await fetchSubscriptions();
+      await fetchEvents();
+      subForm = {
+        name: '',
+        url: '',
+        color: SUBSCRIPTION_COLORS[subscriptions.length % SUBSCRIPTION_COLORS.length].value
+      };
+    } catch (err) {
+      subError = 'Network error while adding calendar subscription.';
+    } finally {
+      subSaving = false;
+    }
+  }
+
+  async function handleToggleSubscription(sub) {
+    try {
+      const res = await fetch(`/api/subscriptions/${encodeURIComponent(sub.id)}`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        }),
+        body: JSON.stringify({ enabled: !sub.enabled })
+      });
+      if (res.ok) {
+        await fetchSubscriptions();
+        await fetchEvents();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleChangeSubColor(sub, newColor) {
+    try {
+      const res = await fetch(`/api/subscriptions/${encodeURIComponent(sub.id)}`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        }),
+        body: JSON.stringify({ color: newColor })
+      });
+      if (res.ok) {
+        await fetchSubscriptions();
+        await fetchEvents();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleDeleteSubscription(subId) {
+    try {
+      const res = await fetch(`/api/subscriptions/${encodeURIComponent(subId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+      if (res.ok) {
+        await fetchSubscriptions();
+        await fetchEvents();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // --- Create / Edit / Delete Events ---
 
   function openCreateModal(startDate, endDate, allDay = false) {
     const now = new Date();
@@ -370,7 +594,7 @@
   }
 
   function openEditModal(ev) {
-    if (!ev) return;
+    if (!ev || ev.readOnly) return;
     editingUid = ev.uid;
     eventForm = {
       title: ev.title || '',
@@ -477,7 +701,10 @@
       start: ecEvent.start,
       end: ecEvent.end,
       location: ecEvent.extendedProps?.location || '',
-      description: ecEvent.extendedProps?.description || ''
+      description: ecEvent.extendedProps?.description || '',
+      readOnly: Boolean(ecEvent.extendedProps?.readOnly),
+      calendarName: ecEvent.extendedProps?.calendarName || 'Ukko Calendar',
+      color: ecEvent.extendedProps?.color || '#2563eb'
     };
     deleteError = '';
   }
@@ -489,7 +716,7 @@
   }
 
   async function handleDeleteEvent() {
-    if (!selectedEvent?.uid) return;
+    if (!selectedEvent?.uid || selectedEvent.readOnly) return;
     deletingEvent = true;
     deleteError = '';
 
@@ -573,6 +800,7 @@
     initTheme();
     if (authenticated) {
       initCalendar();
+      fetchSubscriptions();
     }
   });
 
@@ -638,6 +866,15 @@
   </main>
 {:else}
   <main class="container">
+    <input
+      type="file"
+      accept=".ics,text/calendar"
+      multiple
+      class="sr-only-input"
+      bind:this={icsFileInput}
+      on:change={handleIcsFileSelected}
+    />
+
     <header class="header">
       <div class="header-left">
         <div class="logo-lockup" aria-label="Ukko Cal">
@@ -658,8 +895,10 @@
           </svg>
           <span class="logo-wordmark">UKKO <span class="logo-wordmark-accent">CAL</span></span>
         </div>
-        {#if loadingEvents}
-          <span class="status-pill">Syncing CalDAV...</span>
+        {#if loadingEvents || importingIcs}
+          <span class="status-pill">
+            {importingIcs ? 'Importing .ics...' : 'Syncing...'}
+          </span>
         {/if}
       </div>
 
@@ -671,6 +910,23 @@
           title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
         >
           {darkMode ? '☀️ Light' : '🌙 Dark'}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          on:click={openSubscriptionsModal}
+          title="Subscribe to Google Calendar or other .ics feeds"
+        >
+          Calendars{subscriptions.length ? ` (${subscriptions.length + 1})` : ''}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          on:click={triggerIcsImport}
+          disabled={importingIcs}
+          title="Import .ics file into your calendar"
+        >
+          {importingIcs ? 'Importing...' : 'Import .ics'}
         </button>
         <button
           type="button"
@@ -698,10 +954,38 @@
       </div>
     </header>
 
+    {#if subscriptions.length > 0}
+      <div class="calendar-legend">
+        <span class="legend-chip">
+          <span class="legend-dot" style="background: #039be5;"></span>
+          <span>Ukko Calendar</span>
+        </span>
+        {#each subscriptions as sub (sub.id)}
+          <button
+            type="button"
+            class="legend-chip legend-chip-btn"
+            class:legend-chip-muted={!sub.enabled}
+            on:click={() => handleToggleSubscription(sub)}
+            title={sub.enabled ? 'Click to hide calendar' : 'Click to show calendar'}
+          >
+            <span class="legend-dot" style="background: {sub.color || '#9333ea'};"></span>
+            <span>{sub.name}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     {#if bannerError}
       <div class="alert alert-error banner">
         <span>{bannerError}</span>
         <button type="button" class="btn-link" on:click={() => (bannerError = '')}>Dismiss</button>
+      </div>
+    {/if}
+
+    {#if bannerSuccess}
+      <div class="alert alert-success banner">
+        <span>{bannerSuccess}</span>
+        <button type="button" class="btn-link" on:click={() => (bannerSuccess = '')}>Dismiss</button>
       </div>
     {/if}
 
@@ -711,6 +995,131 @@
       bind:this={calendarEl}
     ></div>
   </main>
+
+  {#if showSubscriptionsModal}
+    <div class="modal-backdrop" on:click|self={closeSubscriptionsModal} role="presentation">
+      <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="sub-modal-title">
+        <div class="modal-header">
+          <h2 id="sub-modal-title">Calendars &amp; Google Calendar Subscriptions</h2>
+          <button type="button" class="close-btn" on:click={closeSubscriptionsModal} aria-label="Close">
+            &times;
+          </button>
+        </div>
+
+        <div class="sub-list">
+          <div class="sub-item">
+            <div class="sub-item-left">
+              <span class="legend-dot" style="background: #039be5;"></span>
+              <div>
+                <div class="sub-item-name">Ukko Calendar (Primary)</div>
+                <div class="sub-item-meta">Thundermail CalDAV • Read &amp; Write</div>
+              </div>
+            </div>
+          </div>
+
+          {#each subscriptions as sub (sub.id)}
+            <div class="sub-item">
+              <div class="sub-item-left">
+                <input
+                  type="checkbox"
+                  checked={sub.enabled !== false}
+                  on:change={() => handleToggleSubscription(sub)}
+                  title="Show/hide this calendar"
+                />
+                <input
+                  type="color"
+                  class="color-picker-inline"
+                  value={sub.color || '#9333ea'}
+                  on:change={(e) => handleChangeSubColor(sub, e.target.value)}
+                  title="Change calendar color"
+                />
+                <div>
+                  <div class="sub-item-name">{sub.name}</div>
+                  <div class="sub-item-meta">{sub.url}</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                class="btn btn-ghost btn-sm"
+                on:click={() => handleDeleteSubscription(sub.id)}
+              >
+                Remove
+              </button>
+            </div>
+          {/each}
+        </div>
+
+        <hr class="modal-divider" />
+
+        <form on:submit={handleAddSubscription} class="modal-form">
+          <h3 class="sub-form-heading">Subscribe to Wife's Google Calendar / iCal Feed</h3>
+          <p class="sub-help-text">
+            In Google Calendar: open <strong>Settings</strong> → click the calendar under
+            <em>Settings for my calendars</em> → scroll to <strong>Integrate calendar</strong> →
+            copy the <strong>Secret address in iCal format</strong> (<code>.ics</code> URL).
+          </p>
+
+          {#if subError}
+            <div class="alert alert-error">{subError}</div>
+          {/if}
+
+          <div class="field-row">
+            <label class="field">
+              <span>Calendar Name</span>
+              <input
+                type="text"
+                bind:value={subForm.name}
+                placeholder="e.g. Nicole's Calendar"
+                disabled={subSaving}
+              />
+            </label>
+
+            <div class="field field-color">
+              <span>Color</span>
+              <div class="color-swatches">
+                {#each SUBSCRIPTION_COLORS as swatch}
+                  <button
+                    type="button"
+                    class="swatch-btn"
+                    class:swatch-active={subForm.color === swatch.value}
+                    style="background: {swatch.value};"
+                    on:click={() => (subForm.color = swatch.value)}
+                    title={swatch.name}
+                    aria-label={swatch.name}
+                  ></button>
+                {/each}
+              </div>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Google Calendar iCal (.ics) URL *</span>
+            <input
+              type="text"
+              bind:value={subForm.url}
+              placeholder="https://calendar.google.com/calendar/ical/.../basic.ics"
+              required
+              disabled={subSaving}
+            />
+          </label>
+
+          <div class="modal-actions">
+            <button
+              type="button"
+              class="btn btn-secondary"
+              on:click={closeSubscriptionsModal}
+              disabled={subSaving}
+            >
+              Close
+            </button>
+            <button type="submit" class="btn btn-primary" disabled={subSaving}>
+              {subSaving ? 'Connecting Feed...' : '+ Subscribe Calendar'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {/if}
 
   {#if showEventModal}
     <div class="modal-backdrop" on:click|self={closeEventModal} role="presentation">
@@ -832,7 +1241,16 @@
     <div class="modal-backdrop" on:click|self={closeEventDetails} role="presentation">
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
         <div class="modal-header">
-          <h2 id="detail-modal-title">{selectedEvent.title}</h2>
+          <div>
+            <h2 id="detail-modal-title">{selectedEvent.title}</h2>
+            <div class="detail-calendar-badge">
+              <span class="legend-dot" style="background: {selectedEvent.color || '#039be5'};"></span>
+              <span>{selectedEvent.calendarName || 'Ukko Calendar'}</span>
+              {#if selectedEvent.readOnly}
+                <span class="readonly-tag">Subscribed</span>
+              {/if}
+            </div>
+          </div>
           <button type="button" class="close-btn" on:click={closeEventDetails} aria-label="Close">
             &times;
           </button>
@@ -880,24 +1298,28 @@
           {/if}
         </div>
 
-        <div class="modal-actions modal-actions-split">
-          <button
-            type="button"
-            class="btn btn-danger"
-            on:click={handleDeleteEvent}
-            disabled={deletingEvent}
-          >
-            {deletingEvent ? 'Deleting...' : 'Delete Event'}
-          </button>
-          <div class="modal-actions-right">
+        <div class="modal-actions" class:modal-actions-split={!selectedEvent.readOnly}>
+          {#if !selectedEvent.readOnly}
             <button
               type="button"
-              class="btn btn-primary"
-              on:click={() => openEditModal(selectedEvent)}
+              class="btn btn-danger"
+              on:click={handleDeleteEvent}
               disabled={deletingEvent}
             >
-              Edit Event
+              {deletingEvent ? 'Deleting...' : 'Delete Event'}
             </button>
+          {/if}
+          <div class="modal-actions-right">
+            {#if !selectedEvent.readOnly}
+              <button
+                type="button"
+                class="btn btn-primary"
+                on:click={() => openEditModal(selectedEvent)}
+                disabled={deletingEvent}
+              >
+                Edit Event
+              </button>
+            {/if}
             <button
               type="button"
               class="btn btn-secondary"
@@ -914,6 +1336,10 @@
 {/if}
 
 <style>
+  .sr-only-input {
+    display: none;
+  }
+
   .auth-screen {
     min-height: 100vh;
     display: flex;
@@ -992,7 +1418,7 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: 0.85rem;
   }
 
   .header {
@@ -1025,6 +1451,48 @@
     flex-wrap: wrap;
   }
 
+  .calendar-legend {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .legend-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    padding: 0.25rem 0.65rem;
+    border-radius: 999px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .legend-chip-btn {
+    cursor: pointer;
+    transition: opacity 0.15s ease, border-color 0.15s ease;
+  }
+
+  .legend-chip-btn:hover {
+    border-color: var(--border-color);
+  }
+
+  .legend-chip-muted {
+    opacity: 0.45;
+    text-decoration: line-through;
+  }
+
+  .legend-dot {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 999px;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+
   .calendar-wrapper {
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
@@ -1043,6 +1511,11 @@
     font-weight: 500;
     cursor: pointer;
     transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+
+  .btn-sm {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
   }
 
   .btn-icon {
@@ -1121,6 +1594,12 @@
     border: 1px solid var(--error-border);
   }
 
+  .alert-success {
+    background: var(--pill-bg);
+    color: var(--pill-text);
+    border: 1px solid var(--border-color);
+  }
+
   .banner {
     display: flex;
     align-items: center;
@@ -1145,6 +1624,8 @@
     border-radius: 0.75rem;
     width: 100%;
     max-width: 520px;
+    max-height: 90vh;
+    overflow-y: auto;
     padding: 1.5rem;
     box-shadow: var(--shadow-modal);
     display: flex;
@@ -1152,9 +1633,13 @@
     gap: 1rem;
   }
 
+  .modal-wide {
+    max-width: 600px;
+  }
+
   .modal-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 1rem;
   }
@@ -1165,6 +1650,23 @@
     color: var(--text-primary);
   }
 
+  .detail-calendar-badge {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  .readonly-tag {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    background: var(--bg-subtle);
+    color: var(--text-secondary);
+  }
+
   .close-btn {
     background: none;
     border: none;
@@ -1172,6 +1674,100 @@
     line-height: 1;
     color: var(--text-muted);
     cursor: pointer;
+  }
+
+  .sub-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .sub-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    border-radius: 0.5rem;
+    background: var(--bg-page);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .sub-item-left {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    min-width: 0;
+  }
+
+  .sub-item-name {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .sub-item-meta {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 360px;
+  }
+
+  .color-picker-inline {
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    border: none;
+    border-radius: 0.25rem;
+    background: transparent;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .modal-divider {
+    border: none;
+    border-top: 1px solid var(--border-subtle);
+    margin: 0.25rem 0;
+  }
+
+  .sub-form-heading {
+    margin: 0;
+    font-size: 1rem;
+    color: var(--text-primary);
+  }
+
+  .sub-help-text {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    line-height: 1.45;
+  }
+
+  .field-color {
+    flex: 0 0 auto;
+  }
+
+  .color-swatches {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    height: 2.25rem;
+  }
+
+  .swatch-btn {
+    width: 1.65rem;
+    height: 1.65rem;
+    border-radius: 999px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: transform 0.1s ease, border-color 0.1s ease;
+  }
+
+  .swatch-active {
+    border-color: var(--text-primary);
+    transform: scale(1.12);
   }
 
   .modal-form {

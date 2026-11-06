@@ -26,6 +26,34 @@ defmodule Ukko.ICalTest do
     assert event.location == "https://zoom.us/j/123456789"
   end
 
+  test "converts TZID=\"GMT-08:00\" invited events to proper UTC timestamps" do
+    ics = """
+    BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VTIMEZONE
+    TZID:GMT-08:00
+    BEGIN:STANDARD
+    TZOFFSETFROM:-0800
+    TZOFFSETTO:-0800
+    DTSTART:19700101T000000
+    END:STANDARD
+    END:VTIMEZONE
+    BEGIN:VEVENT
+    UID:1B84EB66-2C07-423D-8FE4-592A2FFBA30B
+    SUMMARY:Samsung Microwave Repair Service
+    DTSTART;TZID="GMT-08:00":20261106T130000
+    DTEND;TZID="GMT-08:00":20261106T160000
+    END:VEVENT
+    END:VCALENDAR
+    """
+
+    assert [event] = ICal.parse_vevents(ics)
+    assert event.title == "Samsung Microwave Repair Service"
+    assert event.start == "2026-11-06T21:00:00Z"
+    assert event.end == "2026-11-07T00:00:00Z"
+    assert event.allDay == false
+  end
+
   test "parses CalDAV multistatus XML response with CDATA, ALTREP, and VALARM" do
     xml = """
     <?xml version="1.0" encoding="utf-8"?>

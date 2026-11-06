@@ -26,8 +26,14 @@ defmodule UkkoWeb.Router do
 
     get "/events", EventController, :index
     post "/events", EventController, :create
+    post "/events/import", EventController, :import_ics
     put "/events/:uid", EventController, :update
     delete "/events/:uid", EventController, :delete
+
+    get "/subscriptions", EventController, :list_subscriptions
+    post "/subscriptions", EventController, :create_subscription
+    put "/subscriptions/:id", EventController, :update_subscription
+    delete "/subscriptions/:id", EventController, :delete_subscription
   end
 
   scope "/", UkkoWeb do

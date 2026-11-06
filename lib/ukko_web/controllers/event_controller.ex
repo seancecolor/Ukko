@@ -1,7 +1,7 @@
 defmodule UkkoWeb.EventController do
   use UkkoWeb, :controller
 
-  alias Ukko.{CalDAV, ICal, Zoom}
+  alias Ukko.{CalDAV, ICal, Subscriptions, Zoom}
 
   @doc """
   GET /api/events?start=ISO8601&end=ISO8601
@@ -10,11 +10,14 @@ defmodule UkkoWeb.EventController do
     start_iso = Map.get(params, "start")
     end_iso = Map.get(params, "end")
 
-    case CalDAV.list_events(start_iso, end_iso) do
+    caldav_task = Task.async(fn -> CalDAV.list_events(start_iso, end_iso) end)
+    sub_events = Subscriptions.fetch_events(start_iso, end_iso)
+
+    case Task.await(caldav_task, 20_000) do
       {:ok, events} ->
         conn
         |> put_status(:ok)
-        |> json(events)
+        |> json(events ++ sub_events)
 
       {:error, reason} ->
         conn
@@ -40,6 +43,122 @@ defmodule UkkoWeb.EventController do
   """
   def update(conn, %{"uid" => uid} = params) do
     save_event(conn, uid, params, :ok)
+  end
+
+  @doc """
+  POST /api/events/import
+  Accepts `{ "ics": "<raw .ics text>" }` or `{ "ics_list": ["<raw .ics>", ...] }`.
+  """
+  def import_ics(conn, params) do
+    ics_payloads =
+      cond do
+        is_list(Map.get(params, "ics_list")) ->
+          Enum.filter(Map.get(params, "ics_list"), &is_binary/1)
+
+        is_binary(Map.get(params, "ics")) ->
+          [Map.get(params, "ics")]
+
+        true ->
+          []
+      end
+
+    if ics_payloads == [] do
+      conn
+      |> put_status(:bad_request)
+      |> json(%{error: "No .ics content provided"})
+    else
+      combined_ics = Enum.join(ics_payloads, "\r\n")
+
+      case CalDAV.import_ics(combined_ics) do
+        {:ok, imported_events} ->
+          conn
+          |> put_status(:created)
+          |> json(%{
+            imported: length(imported_events),
+            events: imported_events
+          })
+
+        {:error, :no_events_found} ->
+          conn
+          |> put_status(:unprocessable_entity)
+          |> json(%{error: "No valid VEVENT entries found in the .ics file"})
+
+        {:error, reason} ->
+          conn
+          |> put_status(:bad_gateway)
+          |> json(%{
+            error: "Failed to import .ics file to CalDAV",
+            details: format_reason(reason)
+          })
+      end
+    end
+  end
+
+  @doc """
+  GET /api/subscriptions
+  """
+  def list_subscriptions(conn, _params) do
+    subs = Subscriptions.list_subscriptions()
+
+    conn
+    |> put_status(:ok)
+    |> json(subs)
+  end
+
+  @doc """
+  POST /api/subscriptions
+  Accepts `{ "name": "Nicole's Calendar", "url": "https://...", "color": "#9333ea" }`.
+  """
+  def create_subscription(conn, params) do
+    case Subscriptions.add_subscription(params) do
+      {:ok, sub} ->
+        conn
+        |> put_status(:created)
+        |> json(sub)
+
+      {:error, reason} when is_binary(reason) ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{error: reason})
+
+      {:error, reason} ->
+        conn
+        |> put_status(:bad_gateway)
+        |> json(%{error: "Failed to add calendar subscription", details: format_reason(reason)})
+    end
+  end
+
+  @doc """
+  PUT /api/subscriptions/:id
+  """
+  def update_subscription(conn, %{"id" => id} = params) do
+    case Subscriptions.update_subscription(id, params) do
+      {:ok, sub} ->
+        conn
+        |> put_status(:ok)
+        |> json(sub)
+
+      {:error, :not_found} ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{error: "Subscription not found"})
+
+      {:error, reason} ->
+        conn
+        |> put_status(:bad_gateway)
+        |> json(%{error: "Failed to update subscription", details: format_reason(reason)})
+    end
+  end
+
+  @doc """
+  DELETE /api/subscriptions/:id
+  """
+  def delete_subscription(conn, %{"id" => id}) do
+    :ok = Subscriptions.delete_subscription(id)
+
+    conn
+    |> put_status(:ok)
+    |> json(%{deleted: true, id: id})
   end
 
   defp save_event(conn, uid, params, success_status) do

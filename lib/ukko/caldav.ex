@@ -27,7 +27,7 @@ defmodule Ukko.CalDAV do
              decode_body: false
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
-          events = parse_multistatus_response(to_string(body))
+          events = parse_multistatus_response(to_string(body), start_iso, end_iso)
           {:ok, events}
 
         {:ok, %Req.Response{status: status, body: body}} ->
@@ -45,8 +45,15 @@ defmodule Ukko.CalDAV do
   Creates or updates a calendar event on the CalDAV server via `PUT <caldav_url><uid>.ics`.
   """
   def put_event(%{uid: uid} = event_attrs) do
+    ics_payload = ICal.build_ics(event_attrs)
+    put_raw_ics(uid, ics_payload)
+  end
+
+  @doc """
+  Uploads a raw `.ics` payload to `<caldav_url><uid>.ics`.
+  """
+  def put_raw_ics(uid, ics_payload) when is_binary(uid) and is_binary(ics_payload) do
     with {:ok, cfg} <- get_config() do
-      ics_payload = ICal.build_ics(event_attrs)
       event_url = build_event_url(cfg.url, uid)
 
       case Req.put(event_url,
@@ -67,6 +74,79 @@ defmodule Ukko.CalDAV do
     end
   rescue
     e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  @doc """
+  Fetches a raw `.ics` resource by `uid` from `<caldav_url><uid>.ics`.
+  """
+  def get_raw_ics(uid) when is_binary(uid) do
+    with {:ok, cfg} <- get_config() do
+      event_url = build_event_url(cfg.url, uid)
+
+      case Req.get(event_url,
+             auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+             decode_body: false
+           ) do
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          {:ok, to_string(body)}
+
+        {:ok, %Req.Response{status: 404}} ->
+          {:error, :not_found}
+
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, {:caldav_error, status, body}}
+
+        {:error, exception} ->
+          {:error, exception}
+      end
+    end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  @doc """
+  Imports a raw `.ics` string containing one or more VEVENTs into the CalDAV calendar.
+  """
+  def import_ics(ics_text) when is_binary(ics_text) do
+    chunks = ICal.split_ics_by_uid(ics_text)
+
+    if chunks == [] do
+      {:error, :no_events_found}
+    else
+      results =
+        Enum.map(chunks, fn {uid, single_ics} ->
+          case put_raw_ics(uid, single_ics) do
+            {:ok, ^uid} ->
+              {:ok, uid}
+
+            {:error, _} ->
+              # Fallback: rebuild normalized .ics if server rejected vendor properties
+              case ICal.parse_vevents(single_ics) do
+                [ev | _] ->
+                  put_event(%{
+                    uid: uid,
+                    title: ev.title,
+                    start: ev.start,
+                    end: ev.end,
+                    description: ev.description,
+                    location: ev.location
+                  })
+
+                [] ->
+                  {:error, :invalid_event}
+              end
+          end
+        end)
+
+      case Enum.find(results, &match?({:error, _}, &1)) do
+        nil ->
+          parsed_events = ICal.parse_vevents(ics_text)
+          {:ok, parsed_events}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
   end
 
   @doc """
@@ -105,7 +185,8 @@ defmodule Ukko.CalDAV do
   @doc """
   Parses a CalDAV `<multistatus>` XML body using `SweetXml` and returns a list of parsed VEVENT maps.
   """
-  def parse_multistatus_response(xml_body) when is_binary(xml_body) do
+  def parse_multistatus_response(xml_body, start_iso \\ nil, end_iso \\ nil)
+      when is_binary(xml_body) do
     xml_body
     |> xpath(~x"//*[local-name()='calendar-data']"l)
     |> Enum.flat_map(fn node ->
@@ -114,7 +195,7 @@ defmodule Ukko.CalDAV do
         |> xpath(~x"./text()"ls)
         |> Enum.join("")
 
-      ICal.parse_vevents(ics_data)
+      ICal.parse_vevents(ics_data, start_iso, end_iso)
     end)
   rescue
     _ -> []
@@ -123,31 +204,27 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Builds the CalDAV `calendar-query` XML payload, including `<C:time-range>` and `<C:expand>`
-  when `start_iso` and `end_iso` are given.
+  Builds the CalDAV `calendar-query` XML payload with `<C:time-range>` when `start_iso`
+  or `end_iso` are given.
   """
   def build_report_xml(start_iso, end_iso) do
-    {calendar_data_tag, time_range_tag} =
+    time_range_tag =
       case {non_empty(start_iso), non_empty(end_iso)} do
         {nil, nil} ->
-          {"<C:calendar-data/>", ""}
+          ""
 
         {s, nil} ->
           start_utc = ICal.iso8601_to_ical_utc(s)
-          {"<C:calendar-data/>", ~s(<C:time-range start="#{start_utc}"/>)}
+          ~s(<C:time-range start="#{start_utc}"/>)
 
         {nil, e} ->
           end_utc = ICal.iso8601_to_ical_utc(e)
-          {"<C:calendar-data/>", ~s(<C:time-range end="#{end_utc}"/>)}
+          ~s(<C:time-range end="#{end_utc}"/>)
 
         {s, e} ->
           start_utc = ICal.iso8601_to_ical_utc(s)
           end_utc = ICal.iso8601_to_ical_utc(e)
-
-          {
-            ~s(<C:calendar-data><C:expand start="#{start_utc}" end="#{end_utc}"/></C:calendar-data>),
-            ~s(<C:time-range start="#{start_utc}" end="#{end_utc}"/>)
-          }
+          ~s(<C:time-range start="#{start_utc}" end="#{end_utc}"/>)
       end
 
     """
@@ -155,7 +232,7 @@ defmodule Ukko.CalDAV do
     <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
       <D:prop>
         <D:getetag/>
-        #{calendar_data_tag}
+        <C:calendar-data/>
       </D:prop>
       <C:filter>
         <C:comp-filter name="VCALENDAR">

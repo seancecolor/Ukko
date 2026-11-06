@@ -10,6 +10,7 @@ defmodule Ukko.Application do
       {DNSCluster, query: Application.get_env(:ukko, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Ukko.PubSub},
       Ukko.ZoomTokenCache,
+      Ukko.Subscriptions,
       UkkoWeb.Endpoint
     ]
 
