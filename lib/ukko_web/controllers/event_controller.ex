@@ -161,6 +161,30 @@ defmodule UkkoWeb.EventController do
     |> json(%{deleted: true, id: id})
   end
 
+  @doc """
+  GET /api/feed-token
+  Returns the secret token for the user's published `.ics` feed.
+  """
+  def get_feed_token(conn, _params) do
+    token = Subscriptions.get_feed_token()
+
+    conn
+    |> put_status(:ok)
+    |> json(%{token: token})
+  end
+
+  @doc """
+  POST /api/feed-token/rotate
+  Generates and persists a new secret `.ics` feed token.
+  """
+  def rotate_feed_token(conn, _params) do
+    {:ok, token} = Subscriptions.rotate_feed_token()
+
+    conn
+    |> put_status(:ok)
+    |> json(%{token: token})
+  end
+
   defp save_event(conn, uid, params, success_status) do
     title = Map.get(params, "title")
     start_iso = Map.get(params, "start")

@@ -52,6 +52,16 @@
     color: '#9333ea'
   };
 
+  // Published .ics feed state (shareable URL for primary calendar)
+  let feedToken = '';
+  let feedCopied = false;
+  let rotatingToken = false;
+
+  $: publishedFeedUrl =
+    feedToken && typeof window !== 'undefined'
+      ? `${window.location.origin}/api/feed/${feedToken}/ukko.ics`
+      : '';
+
   // Create / Edit Event modal state
   let showEventModal = false;
   let editingUid = null;
@@ -448,8 +458,64 @@
     }
   }
 
+  async function fetchFeedToken() {
+    if (!authenticated) return;
+    try {
+      const res = await fetch('/api/feed-token', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data.token) {
+          feedToken = data.token;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleCopyFeedUrl() {
+    if (!publishedFeedUrl) return;
+    try {
+      await navigator.clipboard.writeText(publishedFeedUrl);
+      feedCopied = true;
+      setTimeout(() => {
+        feedCopied = false;
+      }, 2000);
+    } catch {
+      // fallback if clipboard API unavailable
+    }
+  }
+
+  async function handleRotateFeedToken() {
+    if (rotatingToken) return;
+    rotatingToken = true;
+    try {
+      const res = await fetch('/api/feed-token/rotate', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data.token) {
+          feedToken = data.token;
+          feedCopied = false;
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      rotatingToken = false;
+    }
+  }
+
   function openSubscriptionsModal() {
     subError = '';
+    feedCopied = false;
     subForm = {
       name: '',
       url: '',
@@ -457,6 +523,7 @@
     };
     showSubscriptionsModal = true;
     fetchSubscriptions();
+    fetchFeedToken();
   }
 
   function closeSubscriptionsModal() {
@@ -1007,14 +1074,53 @@
         </div>
 
         <div class="sub-list">
-          <div class="sub-item">
-            <div class="sub-item-left">
-              <span class="legend-dot" style="background: #039be5;"></span>
-              <div>
-                <div class="sub-item-name">Ukko Calendar (Primary)</div>
-                <div class="sub-item-meta">Thundermail CalDAV • Read &amp; Write</div>
+          <div class="sub-item sub-item-primary">
+            <div class="sub-item-top">
+              <div class="sub-item-left">
+                <span class="legend-dot" style="background: #039be5;"></span>
+                <div>
+                  <div class="sub-item-name">Ukko Calendar (Primary)</div>
+                  <div class="sub-item-meta">Thundermail CalDAV • Read &amp; Write</div>
+                </div>
               </div>
             </div>
+
+            {#if publishedFeedUrl}
+              <div class="publish-box">
+                <div class="publish-box-label">
+                  <span>Shareable iCal (<code>.ics</code>) URL for your calendar only:</span>
+                  <button
+                    type="button"
+                    class="btn-link"
+                    on:click={handleRotateFeedToken}
+                    disabled={rotatingToken}
+                    title="Generate a new secret link and invalidate the old one"
+                  >
+                    {rotatingToken ? 'Resetting...' : 'Reset Link'}
+                  </button>
+                </div>
+                <div class="publish-url-row">
+                  <input
+                    type="text"
+                    class="publish-url-input"
+                    readonly
+                    value={publishedFeedUrl}
+                    on:focus={(e) => e.target.select()}
+                  />
+                  <button
+                    type="button"
+                    class="btn btn-secondary btn-sm"
+                    on:click={handleCopyFeedUrl}
+                  >
+                    {feedCopied ? 'Copied!' : 'Copy URL'}
+                  </button>
+                </div>
+                <div class="publish-hint">
+                  Your wife can subscribe in Google Calendar via <strong>+</strong> next to
+                  <em>Other calendars</em> → <strong>From URL</strong> → paste this link.
+                </div>
+              </div>
+            {/if}
           </div>
 
           {#each subscriptions as sub (sub.id)}
@@ -1691,6 +1797,60 @@
     border-radius: 0.5rem;
     background: var(--bg-page);
     border: 1px solid var(--border-subtle);
+  }
+
+  .sub-item-primary {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .sub-item-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .publish-box {
+    margin-top: 0.25rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .publish-box-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+
+  .publish-url-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .publish-url-input {
+    flex: 1;
+    padding: 0.35rem 0.55rem;
+    font-size: 0.78rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 0.375rem;
+    color: var(--text-primary);
+  }
+
+  .publish-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.4;
   }
 
   .sub-item-left {

@@ -15,6 +15,11 @@ defmodule UkkoWeb.Router do
   end
 
   scope "/api", UkkoWeb do
+    get "/feed/:token/ukko.ics", FeedController, :show
+    get "/feed/:token", FeedController, :show
+  end
+
+  scope "/api", UkkoWeb do
     pipe_through :api
 
     get "/health", HealthController, :index
@@ -34,6 +39,9 @@ defmodule UkkoWeb.Router do
     post "/subscriptions", EventController, :create_subscription
     put "/subscriptions/:id", EventController, :update_subscription
     delete "/subscriptions/:id", EventController, :delete_subscription
+
+    get "/feed-token", EventController, :get_feed_token
+    post "/feed-token/rotate", EventController, :rotate_feed_token
   end
 
   scope "/", UkkoWeb do

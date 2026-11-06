@@ -183,6 +183,98 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
+  Exports the user's entire primary Thundermail CalDAV calendar as a single RFC 5545
+  `VCALENDAR` (`.ics`) string (excluding subscribed calendars and internal Ukko config).
+  """
+  def export_calendar_ics do
+    with {:ok, cfg} <- get_config() do
+      xml_body = build_report_xml(nil, nil)
+
+      case Req.request(
+             method: "REPORT",
+             url: cfg.url,
+             auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+             headers: [
+               {"depth", "1"},
+               {"content-type", "application/xml; charset=utf-8"}
+             ],
+             body: xml_body,
+             decode_body: false
+           ) do
+        {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
+          {:ok, build_combined_ics(to_string(body))}
+
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, {:caldav_error, status, body}}
+
+        {:error, exception} ->
+          {:error, exception}
+      end
+    end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  @doc """
+  Combines all `<calendar-data>` blocks from a CalDAV `<multistatus>` XML response into a
+  single RFC 5545 `VCALENDAR` document.
+  """
+  def build_combined_ics(xml_body) when is_binary(xml_body) do
+    ics_blobs =
+      xml_body
+      |> xpath(~x"//*[local-name()='calendar-data']"l)
+      |> Enum.map(fn node ->
+        node
+        |> xpath(~x"./text()"ls)
+        |> Enum.join("")
+      end)
+
+    vtimezones =
+      ics_blobs
+      |> Enum.flat_map(fn ics ->
+        ~r/BEGIN:VTIMEZONE\r?\n.*?END:VTIMEZONE/s
+        |> Regex.scan(ics)
+        |> Enum.map(fn [block] -> String.trim(block) end)
+      end)
+      |> Enum.uniq_by(fn vt_block ->
+        case Regex.run(~r/^TZID(?:;[^:]*)?:(.*)$/m, vt_block, capture: :all_but_first) do
+          [tzid] -> String.trim(tzid)
+          _ -> vt_block
+        end
+      end)
+
+    vevents =
+      ics_blobs
+      |> Enum.flat_map(fn ics ->
+        ~r/BEGIN:VEVENT\r?\n.*?END:VEVENT/s
+        |> Regex.scan(ics)
+        |> Enum.map(fn [block] -> String.trim(block) end)
+      end)
+      |> Enum.reject(fn vevent_block ->
+        String.contains?(vevent_block, "UID:ukko-subscriptions-config")
+      end)
+
+    lines =
+      [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Ukko Cal//CalDAV Feed//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Ukko Calendar",
+        "X-WR-TIMEZONE:America/Los_Angeles"
+      ] ++ vtimezones ++ vevents ++ ["END:VCALENDAR", ""]
+
+    Enum.join(lines, "\r\n")
+  rescue
+    _ ->
+      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Ukko Cal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+  catch
+    :exit, _ ->
+      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Ukko Cal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+  end
+
+  @doc """
   Parses a CalDAV `<multistatus>` XML body using `SweetXml` and returns a list of parsed VEVENT maps.
   """
   def parse_multistatus_response(xml_body, start_iso \\ nil, end_iso \\ nil)

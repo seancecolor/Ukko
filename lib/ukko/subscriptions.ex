@@ -1,8 +1,8 @@
 defmodule Ukko.Subscriptions do
   @moduledoc """
-  Manages external iCal (`.ics`) calendar subscriptions (such as Google Calendar feeds),
-  persisting configuration to the CalDAV server (`ukko-subscriptions-config.ics`) and
-  caching feeds in ETS.
+  Manages external iCal (`.ics`) calendar subscriptions (such as Google Calendar feeds)
+  and the user's published `.ics` feed token, persisting configuration to the CalDAV server
+  (`ukko-subscriptions-config.ics`) and caching feeds in ETS.
   """
 
   use GenServer
@@ -18,6 +18,41 @@ defmodule Ukko.Subscriptions do
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
   end
+
+  @doc """
+  Returns the secret token used to publish the user's primary calendar as a subscribable `.ics` URL.
+  """
+  def get_feed_token do
+    case :ets.lookup(@table, :feed_token) do
+      [{:feed_token, token}] when is_binary(token) and token != "" ->
+        token
+
+      _ ->
+        GenServer.call(__MODULE__, :get_feed_token, 15_000)
+    end
+  rescue
+    _ -> default_feed_token()
+  end
+
+  @doc """
+  Rotates the secret `.ics` feed token, invalidating the previous share URL.
+  """
+  def rotate_feed_token do
+    GenServer.call(__MODULE__, :rotate_feed_token, 15_000)
+  end
+
+  @doc """
+  Verifies whether a candidate token matches the active `.ics` feed token.
+  """
+  def valid_feed_token?(candidate) when is_binary(candidate) do
+    expected = get_feed_token()
+
+    byte_size(candidate) > 0 and
+      byte_size(candidate) == byte_size(expected) and
+      Plug.Crypto.secure_compare(candidate, expected)
+  end
+
+  def valid_feed_token?(_), do: false
 
   @doc """
   Returns the list of configured calendar subscriptions.
@@ -190,23 +225,32 @@ defmodule Ukko.Subscriptions do
 
   @impl true
   def handle_call(:load_subscriptions, _from, state) do
-    subs =
-      case :ets.lookup(@table, :subscriptions) do
-        [{:subscriptions, existing}] when is_list(existing) ->
-          existing
-
-        _ ->
-          loaded = load_from_caldav()
-          :ets.insert(@table, {:subscriptions, loaded})
-          loaded
-      end
-
+    {subs, _token} = ensure_loaded()
     {:reply, subs, state}
   end
 
   @impl true
+  def handle_call(:get_feed_token, _from, state) do
+    {_subs, token} = ensure_loaded()
+    {:reply, token, state}
+  end
+
+  @impl true
+  def handle_call(:rotate_feed_token, _from, state) do
+    {subs, _old_token} = ensure_loaded()
+
+    new_token =
+      :crypto.strong_rand_bytes(24)
+      |> Base.url_encode64(padding: false)
+
+    :ets.insert(@table, {:feed_token, new_token})
+    save_to_caldav(subs, new_token)
+    {:reply, {:ok, new_token}, state}
+  end
+
+  @impl true
   def handle_call({:put_subscription, new_sub}, _from, state) do
-    current = current_subs()
+    {current, token} = ensure_loaded()
 
     updated =
       current
@@ -214,13 +258,13 @@ defmodule Ukko.Subscriptions do
       |> Kernel.++([new_sub])
 
     :ets.insert(@table, {:subscriptions, updated})
-    save_to_caldav(updated)
+    save_to_caldav(updated, token)
     {:reply, {:ok, new_sub}, state}
   end
 
   @impl true
   def handle_call({:update_subscription, id, params}, _from, state) do
-    current = current_subs()
+    {current, token} = ensure_loaded()
 
     case Enum.find(current, fn s -> Map.get(s, "id") == id end) do
       nil ->
@@ -239,32 +283,48 @@ defmodule Ukko.Subscriptions do
           end)
 
         :ets.insert(@table, {:subscriptions, updated_list})
-        save_to_caldav(updated_list)
+        save_to_caldav(updated_list, token)
         {:reply, {:ok, updated_sub}, state}
     end
   end
 
   @impl true
   def handle_call({:delete_subscription, id}, _from, state) do
-    current = current_subs()
+    {current, token} = ensure_loaded()
     updated = Enum.reject(current, fn s -> Map.get(s, "id") == id end)
     :ets.insert(@table, {:subscriptions, updated})
-    save_to_caldav(updated)
+    save_to_caldav(updated, token)
     {:reply, :ok, state}
   end
 
   # --- Internal Helpers ---
 
-  defp current_subs do
-    case :ets.lookup(@table, :subscriptions) do
-      [{:subscriptions, subs}] when is_list(subs) ->
-        subs
+  defp ensure_loaded do
+    subs_lookup = :ets.lookup(@table, :subscriptions)
+    token_lookup = :ets.lookup(@table, :feed_token)
+
+    case {subs_lookup, token_lookup} do
+      {[{:subscriptions, subs}], [{:feed_token, token}]}
+      when is_list(subs) and is_binary(token) and token != "" ->
+        {subs, token}
 
       _ ->
-        loaded = load_from_caldav()
-        :ets.insert(@table, {:subscriptions, loaded})
-        loaded
+        {loaded_subs, loaded_token} = load_from_caldav()
+        :ets.insert(@table, {:subscriptions, loaded_subs})
+        :ets.insert(@table, {:feed_token, loaded_token})
+        {loaded_subs, loaded_token}
     end
+  end
+
+  defp default_feed_token do
+    url = Application.get_env(:ukko, :thundermail_caldav_url) || ""
+    user = Application.get_env(:ukko, :thundermail_user) || ""
+    passcode = Application.get_env(:ukko, :auth_passcode) || "ukko-default"
+    secret = "#{url}|#{user}|#{passcode}"
+
+    :crypto.mac(:hmac, :sha256, secret, "ukko-primary-ical-feed-v1")
+    |> Base.url_encode64(padding: false)
+    |> binary_part(0, 32)
   end
 
   defp maybe_put_str(sub, key, params) do
@@ -369,12 +429,17 @@ defmodule Ukko.Subscriptions do
         decode_config_ics(ics_text)
 
       _ ->
-        []
+        {[], default_feed_token()}
     end
   end
 
-  defp save_to_caldav(subs) when is_list(subs) do
-    json_str = Jason.encode!(subs)
+  defp save_to_caldav(subs, feed_token) when is_list(subs) and is_binary(feed_token) do
+    payload = %{
+      "subscriptions" => subs,
+      "feed_token" => feed_token
+    }
+
+    json_str = Jason.encode!(payload)
     b64 = Base.encode64(json_str)
 
     ics =
@@ -399,15 +464,25 @@ defmodule Ukko.Subscriptions do
     case Regex.run(~r/UKKO_SUBS_B64:([A-Za-z0-9+\/=]+)/, unfolded, capture: :all_but_first) do
       [b64] ->
         with {:ok, json} <- Base.decode64(b64),
-             {:ok, list} when is_list(list) <- Jason.decode(json) do
-          list
+             {:ok, decoded} <- Jason.decode(json) do
+          case decoded do
+            %{"subscriptions" => list} = map when is_list(list) ->
+              tok = Map.get(map, "feed_token")
+              valid_tok = if is_binary(tok) and tok != "", do: tok, else: default_feed_token()
+              {list, valid_tok}
+
+            list when is_list(list) ->
+              {list, default_feed_token()}
+
+            _ ->
+              {[], default_feed_token()}
+          end
         else
-          _ -> []
+          _ -> {[], default_feed_token()}
         end
 
       _ ->
-        []
+        {[], default_feed_token()}
     end
   end
 end
-
