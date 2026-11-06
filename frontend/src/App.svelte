@@ -74,7 +74,7 @@
       : '';
 
   // App version state
-  let appVersion = '0.1.2';
+  let appVersion = '0.1.4';
 
   // Animating ASCII art state for THUNDERCAL
   const ASCII_THUNDER_BASE = [
