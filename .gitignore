@@ -5,6 +5,9 @@
 /priv/static/assets/
 /priv/static/index.html
 /priv/static/logo.jpg
+/priv/static/favicon.ico
+/priv/static/favicon.png
+/priv/static/apple-touch-icon.png
 erl_crash.dump
 
 # Node / Svelte

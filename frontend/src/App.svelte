@@ -8,6 +8,17 @@
 
   const TOKEN_KEY = 'ukko_auth_token';
   const THEME_KEY = 'ukko_theme';
+  const NOTIF_SETTINGS_KEY = 'ukko_notification_settings';
+  const NOTIFIED_EVENTS_KEY = 'ukko_notified_events';
+
+  const REMINDER_OPTIONS = [
+    { label: 'At time of event', minutes: 0 },
+    { label: '5 minutes before', minutes: 5 },
+    { label: '10 minutes before', minutes: 10 },
+    { label: '15 minutes before', minutes: 15 },
+    { label: '30 minutes before', minutes: 30 },
+    { label: '1 hour before', minutes: 60 }
+  ];
 
   const SUBSCRIPTION_COLORS = [
     { name: 'Purple', value: '#9333ea' },
@@ -81,6 +92,20 @@
   let selectedEvent = null;
   let deletingEvent = false;
   let deleteError = '';
+
+  // Browser Desktop Notifications state
+  let notificationsSupported = false;
+  let notificationPermission = 'default';
+  let showNotificationsModal = false;
+  let notifStatusMsg = '';
+  let notificationSettings = {
+    enabled: false,
+    leadMinutes: 10,
+    notifyAtStart: true,
+    includeSubscribed: true
+  };
+  let reminderIntervalId = null;
+  let backgroundSyncIntervalId = null;
 
   const localHourFormatter = new Intl.DateTimeFormat('en-US', {
     hour: 'numeric'
@@ -293,6 +318,7 @@
       await tick();
       initCalendar();
       fetchSubscriptions();
+      startNotificationTimers();
     } catch (err) {
       authError = 'Could not reach server. Please try again.';
     } finally {
@@ -304,6 +330,7 @@
     token = '';
     authenticated = false;
     localStorage.removeItem(TOKEN_KEY);
+    stopNotificationTimers();
     destroyCalendar();
   }
 
@@ -379,6 +406,7 @@
       if (calendar) {
         calendar.setOption('events', events);
       }
+      checkUpcomingNotifications();
     } catch (err) {
       bannerError = 'Network error while fetching calendar events.';
     } finally {
@@ -817,6 +845,298 @@
     }
   }
 
+  // --- Browser Desktop Notifications ---
+
+  function initNotifications() {
+    if (typeof window === 'undefined') return;
+    notificationsSupported = 'Notification' in window;
+    if (notificationsSupported) {
+      notificationPermission = Notification.permission;
+    } else {
+      notificationPermission = 'unsupported';
+    }
+
+    try {
+      const raw = localStorage.getItem(NOTIF_SETTINGS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        notificationSettings = {
+          enabled: Boolean(parsed.enabled) && notificationPermission === 'granted',
+          leadMinutes:
+            typeof parsed.leadMinutes === 'number' && parsed.leadMinutes >= 0
+              ? parsed.leadMinutes
+              : 10,
+          notifyAtStart: parsed.notifyAtStart !== false,
+          includeSubscribed: parsed.includeSubscribed !== false
+        };
+      }
+    } catch {
+      // ignore invalid storage
+    }
+  }
+
+  function persistNotificationSettings() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(NOTIF_SETTINGS_KEY, JSON.stringify(notificationSettings));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+
+  function openNotificationsModal() {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      notificationPermission = Notification.permission;
+    }
+    notifStatusMsg = '';
+    showNotificationsModal = true;
+  }
+
+  function closeNotificationsModal() {
+    showNotificationsModal = false;
+    notifStatusMsg = '';
+  }
+
+  async function handleToggleNotifications() {
+    notifStatusMsg = '';
+    if (!notificationsSupported) {
+      notifStatusMsg = 'Desktop notifications are not supported by this browser.';
+      return;
+    }
+
+    if (notificationSettings.enabled) {
+      notificationSettings = { ...notificationSettings, enabled: false };
+      persistNotificationSettings();
+      return;
+    }
+
+    notificationPermission = Notification.permission;
+    if (notificationPermission === 'default') {
+      try {
+        notificationPermission = await Notification.requestPermission();
+      } catch {
+        // fallback for older callback-style implementations
+        notificationPermission = await new Promise((resolve) =>
+          Notification.requestPermission(resolve)
+        );
+      }
+    }
+
+    if (notificationPermission !== 'granted') {
+      notificationSettings = { ...notificationSettings, enabled: false };
+      persistNotificationSettings();
+      notifStatusMsg =
+        'Permission was denied by your browser. Please allow notifications for this site in your browser address bar settings.';
+      return;
+    }
+
+    notificationSettings = { ...notificationSettings, enabled: true };
+    persistNotificationSettings();
+    checkUpcomingNotifications();
+    notifStatusMsg = 'Desktop notifications enabled!';
+  }
+
+  function handleUpdateNotifSetting(patch) {
+    notificationSettings = { ...notificationSettings, ...patch };
+    persistNotificationSettings();
+    if (notificationSettings.enabled) {
+      checkUpcomingNotifications();
+    }
+  }
+
+  function sendTestNotification() {
+    notifStatusMsg = '';
+    if (!notificationsSupported) {
+      notifStatusMsg = 'Desktop notifications are not supported in this browser.';
+      return;
+    }
+    if (Notification.permission !== 'granted') {
+      handleToggleNotifications().then(() => {
+        if (Notification.permission === 'granted') {
+          sendTestNotification();
+        }
+      });
+      return;
+    }
+
+    try {
+      const n = new Notification('Ukko Calendar — Test Notification', {
+        body: `Desktop reminders are active (${notificationSettings.leadMinutes} min before events).`,
+        icon: '/apple-touch-icon.png',
+        badge: '/favicon.png',
+        tag: `ukko-test-${Date.now()}`
+      });
+      n.onclick = () => {
+        window.focus();
+        n.close();
+      };
+      notifStatusMsg = 'Sent test notification to your desktop!';
+    } catch (err) {
+      notifStatusMsg = 'Failed to trigger notification. Check OS notification settings.';
+    }
+  }
+
+  function loadNotifiedCache() {
+    if (typeof localStorage === 'undefined') return {};
+    try {
+      const raw = localStorage.getItem(NOTIFIED_EVENTS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      const now = Date.now();
+      const cutoff = now - 48 * 60 * 60 * 1000;
+      const cleaned = {};
+      for (const [k, ts] of Object.entries(parsed)) {
+        if (typeof ts === 'number' && ts > cutoff) {
+          cleaned[k] = ts;
+        }
+      }
+      return cleaned;
+    } catch {
+      return {};
+    }
+  }
+
+  function saveNotifiedCache(cache) {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(NOTIFIED_EVENTS_KEY, JSON.stringify(cache));
+    } catch {
+      // ignore
+    }
+  }
+
+  function dispatchEventNotification(ev, startDate, minutesLeft, tagKey) {
+    const timeStr = startDate.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      timeZoneName: 'short'
+    });
+    const estStr = startDate.toLocaleTimeString('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
+      minute: '2-digit'
+    });
+
+    const whenLabel =
+      minutesLeft <= 1
+        ? 'Starting now'
+        : `Starts in ${minutesLeft} min`;
+
+    const lines = [`${whenLabel} • ${timeStr} (${estStr} EST)`];
+    if (ev.extendedProps?.calendarName && ev.extendedProps.calendarName !== 'Ukko Calendar') {
+      lines.push(`Calendar: ${ev.extendedProps.calendarName}`);
+    }
+    if (ev.extendedProps?.location) {
+      lines.push(`Location: ${ev.extendedProps.location}`);
+    }
+
+    try {
+      const n = new Notification(ev.title || '(No Title)', {
+        body: lines.join('\n'),
+        icon: '/apple-touch-icon.png',
+        badge: '/favicon.png',
+        tag: tagKey
+      });
+      n.onclick = () => {
+        window.focus();
+        openEventDetails(ev);
+        n.close();
+      };
+    } catch {
+      // ignore if blocked by browser
+    }
+  }
+
+  function checkUpcomingNotifications() {
+    if (
+      !authenticated ||
+      !notificationsSupported ||
+      !notificationSettings.enabled ||
+      Notification.permission !== 'granted'
+    ) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    const cache = loadNotifiedCache();
+    let cacheModified = false;
+
+    const thresholds = [];
+    if (notificationSettings.leadMinutes > 0) {
+      thresholds.push(notificationSettings.leadMinutes);
+    }
+    if (notificationSettings.notifyAtStart || notificationSettings.leadMinutes === 0) {
+      thresholds.push(0);
+    }
+
+    for (const ev of events) {
+      if (!ev || ev.allDay || ev.extendedProps?.allDay) continue;
+      if (!notificationSettings.includeSubscribed && ev.extendedProps?.readOnly) continue;
+
+      const startDate = ev.start instanceof Date ? ev.start : new Date(ev.start);
+      const startMs = startDate.getTime();
+      if (Number.isNaN(startMs)) continue;
+
+      const diffMs = startMs - nowMs;
+      // Ignore events more than 5 minutes in the past or more than 2 hours in the future
+      if (diffMs < -5 * 60_000 || diffMs > 2 * 60 * 60 * 1000) continue;
+
+      const uid = ev.extendedProps?.uid || ev.id || ev.title;
+      const minutesLeft = Math.max(0, Math.round(diffMs / 60_000));
+
+      for (const leadMin of thresholds) {
+        const key = `${uid}_${startMs}_${leadMin}`;
+        if (cache[key]) continue;
+
+        if (leadMin === 0) {
+          // Trigger when within 5 minutes of start time (matches 5-minute check interval)
+          if (diffMs <= 5 * 60_000 && diffMs >= -5 * 60_000) {
+            cache[key] = nowMs;
+            cacheModified = true;
+            dispatchEventNotification(ev, startDate, minutesLeft, key);
+          }
+        } else {
+          // Trigger when within leadMin window
+          const windowMs = leadMin * 60_000;
+          if (diffMs <= windowMs && diffMs > 0) {
+            cache[key] = nowMs;
+            cacheModified = true;
+            dispatchEventNotification(ev, startDate, minutesLeft, key);
+          }
+        }
+      }
+    }
+
+    if (cacheModified) {
+      saveNotifiedCache(cache);
+    }
+  }
+
+  function startNotificationTimers() {
+    stopNotificationTimers();
+    // Check upcoming notifications every 5 minutes
+    reminderIntervalId = setInterval(() => {
+      checkUpcomingNotifications();
+    }, 5 * 60_000);
+    // Refresh events in the background every 10 minutes while the tab is open
+    backgroundSyncIntervalId = setInterval(() => {
+      if (authenticated && !loadingEvents) {
+        fetchEvents();
+      }
+    }, 10 * 60_000);
+  }
+
+  function stopNotificationTimers() {
+    if (reminderIntervalId) {
+      clearInterval(reminderIntervalId);
+      reminderIntervalId = null;
+    }
+    if (backgroundSyncIntervalId) {
+      clearInterval(backgroundSyncIntervalId);
+      backgroundSyncIntervalId = null;
+    }
+  }
+
   function initCalendar() {
     if (!calendarEl || calendar) return;
 
@@ -865,13 +1185,16 @@
 
   onMount(() => {
     initTheme();
+    initNotifications();
     if (authenticated) {
       initCalendar();
       fetchSubscriptions();
+      startNotificationTimers();
     }
   });
 
   onDestroy(() => {
+    stopNotificationTimers();
     destroyCalendar();
   });
 </script>
@@ -977,6 +1300,17 @@
           title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
         >
           {darkMode ? '☀️ Light' : '🌙 Dark'}
+        </button>
+        <button
+          type="button"
+          class="btn btn-secondary"
+          class:btn-notif-active={notificationSettings.enabled && notificationPermission === 'granted'}
+          on:click={openNotificationsModal}
+          title="Configure browser desktop notifications for upcoming events"
+        >
+          {notificationSettings.enabled && notificationPermission === 'granted'
+            ? '🔔 Alerts On'
+            : '🔕 Alerts'}
         </button>
         <button
           type="button"
@@ -1435,6 +1769,120 @@
               Close
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showNotificationsModal}
+    <div class="modal-backdrop" on:click|self={closeNotificationsModal} role="presentation">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="notif-modal-title">
+        <div class="modal-header">
+          <div>
+            <h2 id="notif-modal-title">Desktop Notifications</h2>
+            <div class="detail-calendar-badge">
+              <span>Browser alerts for upcoming calendar events</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="close-btn"
+            on:click={closeNotificationsModal}
+            aria-label="Close"
+          >
+            &times;
+          </button>
+        </div>
+
+        {#if notifStatusMsg}
+          <div
+            class="alert"
+            class:alert-error={notificationPermission === 'denied' || !notificationsSupported}
+            class:alert-success={notificationPermission !== 'denied' && notificationsSupported}
+          >
+            {notifStatusMsg}
+          </div>
+        {/if}
+
+        <div class="notif-panel">
+          <div class="notif-toggle-row">
+            <div>
+              <div class="sub-item-name">Enable Desktop Alerts</div>
+              <div class="sub-item-meta">
+                {#if !notificationsSupported}
+                  Not supported by this browser
+                {:else if notificationPermission === 'denied'}
+                  Blocked in browser permissions
+                {:else if notificationSettings.enabled && notificationPermission === 'granted'}
+                  Active • Checking upcoming events in the background
+                {:else}
+                  Off • Click to grant permission and enable alerts
+                {/if}
+              </div>
+            </div>
+            <button
+              type="button"
+              class="btn"
+              class:btn-primary={!notificationSettings.enabled}
+              class:btn-secondary={notificationSettings.enabled}
+              on:click={handleToggleNotifications}
+              disabled={!notificationsSupported}
+            >
+              {notificationSettings.enabled && notificationPermission === 'granted'
+                ? 'Disable Alerts'
+                : 'Enable Alerts'}
+            </button>
+          </div>
+
+          <label class="field">
+            <span>Remind me before event starts</span>
+            <select
+              class="select-input"
+              value={notificationSettings.leadMinutes}
+              on:change={(e) =>
+                handleUpdateNotifSetting({ leadMinutes: Number(e.target.value) })}
+            >
+              {#each REMINDER_OPTIONS as opt}
+                <option value={opt.minutes}>{opt.label}</option>
+              {/each}
+            </select>
+          </label>
+
+          {#if notificationSettings.leadMinutes > 0}
+            <label class="checkbox-field">
+              <input
+                type="checkbox"
+                checked={notificationSettings.notifyAtStart}
+                on:change={(e) =>
+                  handleUpdateNotifSetting({ notifyAtStart: e.target.checked })}
+              />
+              <span>Also send a notification right when the event starts</span>
+            </label>
+          {/if}
+
+          <label class="checkbox-field">
+            <input
+              type="checkbox"
+              checked={notificationSettings.includeSubscribed}
+              on:change={(e) =>
+                handleUpdateNotifSetting({ includeSubscribed: e.target.checked })}
+            />
+            <span>Include events from subscribed calendars</span>
+          </label>
+        </div>
+
+        <div class="modal-actions modal-actions-split">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={sendTestNotification}
+            disabled={!notificationsSupported}
+          >
+            Send Test Notification
+          </button>
+          <button type="button" class="btn btn-primary" on:click={closeNotificationsModal}>
+            Done
+          </button>
         </div>
       </div>
     </div>
@@ -1950,7 +2398,8 @@
   }
 
   .field input,
-  .field textarea {
+  .field textarea,
+  .select-input {
     padding: 0.55rem 0.7rem;
     background: var(--bg-page);
     border: 1px solid var(--border-color);
@@ -1961,10 +2410,32 @@
   }
 
   .field input:focus,
-  .field textarea:focus {
+  .field textarea:focus,
+  .select-input:focus {
     outline: none;
     border-color: #3b82f6;
     box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+  }
+
+  .btn-notif-active {
+    border-color: #3b82f6;
+  }
+
+  .notif-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.95rem;
+  }
+
+  .notif-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.75rem 0.85rem;
+    border-radius: 0.5rem;
+    background: var(--bg-page);
+    border: 1px solid var(--border-subtle);
   }
 
   .field-row {

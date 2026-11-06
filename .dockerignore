@@ -6,6 +6,9 @@ frontend/dist
 priv/static/assets
 priv/static/index.html
 priv/static/logo.jpg
+priv/static/favicon.ico
+priv/static/favicon.png
+priv/static/apple-touch-icon.png
 .env
 .env.*
 erl_crash.dump
