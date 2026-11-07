@@ -1,7 +1,7 @@
 defmodule Ukko.ICalTest do
   use ExUnit.Case, async: true
 
-  alias Ukko.{CalDAV, CardDAV, ICal}
+  alias Ukko.{CalDAV, CardDAV, ICal, Zoom}
 
   test "builds and parses a VEVENT payload round-trip" do
     uid = ICal.generate_uid()
@@ -141,5 +141,15 @@ defmodule Ukko.ICalTest do
 
     assert [%{name: "Nicole Visitant", email: "nicole@example.com"}] =
              CardDAV.parse_multistatus_vcards(xml)
+  end
+
+  test "extracts Zoom meeting ID from location URL or description block" do
+    assert Zoom.extract_meeting_id("https://us06web.zoom.us/j/81234567890?pwd=abc", "") ==
+             "81234567890"
+
+    assert Zoom.extract_meeting_id("", "--- Zoom Meeting ---\nMeeting ID: 898 7654 3210\n") ==
+             "89876543210"
+
+    assert Zoom.extract_meeting_id("Conference Room B", "Regular team sync") == nil
   end
 end

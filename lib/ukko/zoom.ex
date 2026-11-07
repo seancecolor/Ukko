@@ -7,6 +7,7 @@ defmodule Ukko.Zoom do
 
   @oauth_url "https://zoom.us/oauth/token"
   @meetings_url "https://api.zoom.us/v2/users/me/meetings"
+  @meeting_base_url "https://api.zoom.us/v2/meetings"
 
   @doc """
   Creates a Zoom meeting and returns `{:ok, %{join_url: ..., id: ..., password: ...}}`.
@@ -47,6 +48,77 @@ defmodule Ukko.Zoom do
         {:error, exception} ->
           {:error, exception}
       end
+    end
+  end
+
+  @doc """
+  Updates an existing Zoom meeting's `topic`, `start_time`, and `duration` via
+  `PATCH /v2/meetings/:meeting_id` when the attached calendar event is moved or edited.
+  """
+  def update_meeting(meeting_id, attrs) when is_binary(meeting_id) or is_integer(meeting_id) do
+    clean_id = meeting_id |> to_string() |> String.replace(~r/[^\d]/, "")
+
+    if clean_id == "" do
+      {:error, :invalid_meeting_id}
+    else
+      with {:ok, token} <- get_access_token() do
+        topic = Map.get(attrs, :title) || "Meeting"
+        start_iso = Map.get(attrs, :start)
+        end_iso = Map.get(attrs, :end)
+
+        {start_time_utc, duration_minutes} = parse_time_and_duration(start_iso, end_iso)
+
+        payload = %{
+          topic: topic,
+          type: 2,
+          start_time: start_time_utc,
+          duration: duration_minutes,
+          timezone: "UTC"
+        }
+
+        url = "#{@meeting_base_url}/#{clean_id}"
+
+        case Req.patch(url,
+               auth: {:bearer, token},
+               json: payload
+             ) do
+          {:ok, %Req.Response{status: status}} when status in [200, 204] ->
+            {:ok, clean_id}
+
+          {:ok, %Req.Response{status: status, body: body}} ->
+            {:error, {:zoom_api_error, status, body}}
+
+          {:error, exception} ->
+            {:error, exception}
+        end
+      end
+    end
+  end
+
+  @doc """
+  Extracts a Zoom numeric Meeting ID from an event's `location` or `description`
+  (matching either `Meeting ID: 1234567890` or a `https://...zoom.us/j/1234567890` URL).
+  Returns `nil` if no Zoom meeting is attached.
+  """
+  def extract_meeting_id(location, description) do
+    loc_str = to_string(location || "")
+    desc_str = to_string(description || "")
+    combined = loc_str <> "\n" <> desc_str
+
+    cond do
+      match = Regex.run(~r/zoom\.us\/(?:j|w)\/(\d{9,13})/i, combined, capture: :all_but_first) ->
+        List.first(match)
+
+      match =
+          Regex.run(~r/Meeting\s+ID:\s*([0-9][0-9\s-]{7,16}[0-9])/i, desc_str,
+            capture: :all_but_first
+          ) ->
+        match
+        |> List.first()
+        |> String.replace(~r/[^\d]/, "")
+
+      true ->
+        nil
     end
   end
 

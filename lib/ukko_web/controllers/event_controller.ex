@@ -227,7 +227,9 @@ defmodule UkkoWeb.EventController do
         attendees: attendees
       }
 
-      with {:ok, enriched_attrs} <- maybe_attach_zoom(base_attrs, create_zoom),
+      is_update = success_status == :ok
+
+      with {:ok, enriched_attrs} <- maybe_sync_zoom(base_attrs, create_zoom, is_update),
            {:ok, ^uid} <- CalDAV.put_event(enriched_attrs) do
         event_response = %{
           id: uid,
@@ -289,9 +291,7 @@ defmodule UkkoWeb.EventController do
     end
   end
 
-  defp maybe_attach_zoom(attrs, false), do: {:ok, attrs}
-
-  defp maybe_attach_zoom(attrs, true) do
+  defp maybe_sync_zoom(attrs, true, _is_update) do
     case Zoom.create_meeting(attrs) do
       {:ok, %{join_url: join_url} = meeting} ->
         updated_description = Zoom.append_meeting_details(attrs.description, meeting)
@@ -307,6 +307,20 @@ defmodule UkkoWeb.EventController do
         {:error, {:zoom_error, reason}}
     end
   end
+
+  defp maybe_sync_zoom(attrs, false, true) do
+    case Zoom.extract_meeting_id(attrs.location, attrs.description) do
+      nil ->
+        {:ok, attrs}
+
+      meeting_id ->
+        # Sync updated start_time, duration, and topic to the existing Zoom meeting
+        _ = Zoom.update_meeting(meeting_id, attrs)
+        {:ok, attrs}
+    end
+  end
+
+  defp maybe_sync_zoom(attrs, false, false), do: {:ok, attrs}
 
   defp format_reason(:missing_caldav_credentials) do
     "Missing THUNDERMAIL_CALDAV_URL, THUNDERMAIL_USER, or THUNDERMAIL_PASS environment variable."
