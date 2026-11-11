@@ -1,7 +1,7 @@
 defmodule UkkoWeb.EventController do
   use UkkoWeb, :controller
 
-  alias Ukko.{CalDAV, CardDAV, ICal, Subscriptions, Zoom}
+  alias Ukko.{CalDAV, CardDAV, ICal, MapQuest, Subscriptions, Zoom}
 
   @doc """
   GET /api/events?start=ISO8601&end=ISO8601
@@ -203,12 +203,33 @@ defmodule UkkoWeb.EventController do
     end
   end
 
+  @doc """
+  GET /api/locations/autocomplete?q=...
+  Queries MapQuest Search Ahead API for live address / POI autocomplete suggestions.
+  """
+  def autocomplete_locations(conn, params) do
+    query = Map.get(params, "q") || ""
+
+    case MapQuest.autocomplete(query) do
+      {:ok, suggestions} ->
+        conn
+        |> put_status(:ok)
+        |> json(suggestions)
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:ok)
+        |> json([])
+    end
+  end
+
   defp save_event(conn, uid, params, success_status) do
     title = Map.get(params, "title")
     start_iso = Map.get(params, "start")
     end_iso = Map.get(params, "end") || start_iso
     description = Map.get(params, "description") || ""
     location = Map.get(params, "location") || ""
+    raw_location_url = Map.get(params, "location_url")
     attendees = ICal.normalize_attendees(Map.get(params, "attendees") || [])
     create_zoom = truthy?(Map.get(params, "create_zoom", false))
 
@@ -224,6 +245,7 @@ defmodule UkkoWeb.EventController do
         end: end_iso,
         description: description,
         location: location,
+        location_url: MapQuest.resolve_location_url(location, raw_location_url),
         attendees: attendees
       }
 
@@ -239,11 +261,13 @@ defmodule UkkoWeb.EventController do
           end: enriched_attrs.end,
           description: enriched_attrs.description,
           location: enriched_attrs.location,
+          locationUrl: enriched_attrs.location_url,
           attendees: enriched_attrs.attendees,
           extendedProps: %{
             uid: uid,
             description: enriched_attrs.description,
             location: enriched_attrs.location,
+            locationUrl: enriched_attrs.location_url,
             attendees: enriched_attrs.attendees
           }
         }
@@ -275,6 +299,8 @@ defmodule UkkoWeb.EventController do
   DELETE /api/events/:uid
   """
   def delete(conn, %{"uid" => uid}) do
+    maybe_cancel_attached_zoom(uid)
+
     case CalDAV.delete_event(uid) do
       :ok ->
         conn
@@ -291,6 +317,27 @@ defmodule UkkoWeb.EventController do
     end
   end
 
+  defp maybe_cancel_attached_zoom(uid) do
+    case CalDAV.get_raw_ics(uid) do
+      {:ok, raw_ics} ->
+        case ICal.parse_vevents(raw_ics) do
+          [ev | _] ->
+            case Zoom.extract_meeting_id(ev.location, ev.description) do
+              nil -> :ok
+              meeting_id -> _ = Zoom.delete_meeting(meeting_id)
+            end
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
   defp maybe_sync_zoom(attrs, true, _is_update) do
     case Zoom.create_meeting(attrs) do
       {:ok, %{join_url: join_url} = meeting} ->
@@ -300,6 +347,7 @@ defmodule UkkoWeb.EventController do
          %{
            attrs
            | location: join_url || attrs.location,
+             location_url: nil,
              description: updated_description
          }}
 

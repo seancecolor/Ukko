@@ -74,7 +74,7 @@
       : '';
 
   // App version state
-  let appVersion = '0.1.5';
+  let appVersion = '0.1.6';
 
   // Animating ASCII art state for THUNDERCAL
   const ASCII_THUNDER_BASE = [
@@ -162,6 +162,13 @@
   let attendeeDropdownOpen = false;
   let attendeeHighlightIndex = 0;
 
+  // MapQuest location autocomplete state
+  let locationSuggestions = [];
+  let locationDropdownOpen = false;
+  let locationHighlightIndex = 0;
+  let locationLoading = false;
+  let locationDebounceTimer = null;
+
   // Create / Edit Event modal state
   let showEventModal = false;
   let editingUid = null;
@@ -173,6 +180,7 @@
     end: '',
     all_day: false,
     location: '',
+    location_url: '',
     description: '',
     create_zoom: false,
     attendees: []
@@ -534,6 +542,7 @@
                 allDay,
                 description: ev.description ?? ev.extendedProps?.description ?? '',
                 location: ev.location ?? ev.extendedProps?.location ?? '',
+                locationUrl: ev.locationUrl ?? ev.extendedProps?.locationUrl ?? '',
                 organizer: ev.organizer ?? ev.extendedProps?.organizer ?? null,
                 attendees: Array.isArray(ev.attendees)
                   ? ev.attendees
@@ -994,6 +1003,105 @@
     return 'Invited';
   }
 
+  function buildMapQuestUrl(locationText, explicitUrl = '') {
+    if (explicitUrl && /^https:\/\/www\.mapquest\.com\//i.test(explicitUrl.trim())) {
+      return explicitUrl.trim();
+    }
+    const trimmed = (locationText || '').trim();
+    if (!trimmed) return '';
+    return `https://www.mapquest.com/search/results?query=${encodeURIComponent(trimmed)}`;
+  }
+
+  async function fetchLocationSuggestions(query) {
+    const q = (query || '').trim();
+    if (q.length < 2 || isUrl(q)) {
+      locationSuggestions = [];
+      locationLoading = false;
+      return;
+    }
+
+    locationLoading = true;
+    try {
+      const res = await fetch(`/api/locations/autocomplete?q=${encodeURIComponent(q)}`, {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => []);
+        if (Array.isArray(data) && eventForm.location.trim() === q) {
+          locationSuggestions = data;
+          locationHighlightIndex = 0;
+        }
+      }
+    } catch {
+      // ignore transient network error
+    } finally {
+      locationLoading = false;
+    }
+  }
+
+  function handleLocationInput(e) {
+    const val = e.target.value;
+    eventForm = {
+      ...eventForm,
+      location: val,
+      location_url: ''
+    };
+    locationDropdownOpen = true;
+    locationHighlightIndex = 0;
+
+    if (locationDebounceTimer) {
+      clearTimeout(locationDebounceTimer);
+    }
+
+    if (!val || val.trim().length < 2 || isUrl(val)) {
+      locationSuggestions = [];
+      locationLoading = false;
+      return;
+    }
+
+    locationDebounceTimer = setTimeout(() => {
+      fetchLocationSuggestions(val);
+    }, 220);
+  }
+
+  function selectLocationSuggestion(suggestion) {
+    if (!suggestion) return;
+    if (locationDebounceTimer) {
+      clearTimeout(locationDebounceTimer);
+    }
+    eventForm = {
+      ...eventForm,
+      location: suggestion.display || suggestion.name || '',
+      location_url: suggestion.url || ''
+    };
+    locationSuggestions = [];
+    locationDropdownOpen = false;
+    locationHighlightIndex = 0;
+  }
+
+  function handleLocationKeydown(e) {
+    if (!locationDropdownOpen || locationSuggestions.length === 0) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      locationHighlightIndex = (locationHighlightIndex + 1) % locationSuggestions.length;
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      locationHighlightIndex =
+        (locationHighlightIndex - 1 + locationSuggestions.length) % locationSuggestions.length;
+    } else if (e.key === 'Enter') {
+      const pick = locationSuggestions[locationHighlightIndex];
+      if (pick) {
+        e.preventDefault();
+        selectLocationSuggestion(pick);
+      }
+    } else if (e.key === 'Escape') {
+      locationDropdownOpen = false;
+    }
+  }
+
   // --- Create / Edit / Delete Events ---
 
   function openCreateModal(startDate, endDate, allDay = false) {
@@ -1010,12 +1118,16 @@
     attendeeQuery = '';
     attendeeDropdownOpen = false;
     attendeeHighlightIndex = 0;
+    locationSuggestions = [];
+    locationDropdownOpen = false;
+    locationHighlightIndex = 0;
     eventForm = {
       title: '',
       start: toLocalInputValue(start),
       end: toLocalInputValue(end),
       all_day: Boolean(allDay),
       location: '',
+      location_url: '',
       description: '',
       create_zoom: false,
       attendees: []
@@ -1033,12 +1145,16 @@
     attendeeQuery = '';
     attendeeDropdownOpen = false;
     attendeeHighlightIndex = 0;
+    locationSuggestions = [];
+    locationDropdownOpen = false;
+    locationHighlightIndex = 0;
     eventForm = {
       title: ev.title || '',
       start: toLocalInputValue(ev.start),
       end: toLocalInputValue(ev.end || ev.start),
       all_day: Boolean(ev.allDay),
       location: ev.location || '',
+      location_url: ev.locationUrl || '',
       description: ev.description || '',
       create_zoom: false,
       attendees: Array.isArray(ev.attendees) ? [...ev.attendees] : []
@@ -1092,6 +1208,7 @@
         start: startVal,
         end: endVal,
         location: eventForm.location.trim(),
+        location_url: eventForm.location_url || '',
         description: eventForm.description.trim(),
         create_zoom: Boolean(eventForm.create_zoom),
         attendees: eventForm.attendees || []
@@ -1181,6 +1298,7 @@
       start: startVal,
       end: endVal,
       location: ev.extendedProps?.location || '',
+      location_url: ev.extendedProps?.locationUrl || '',
       description: ev.extendedProps?.description || '',
       create_zoom: false,
       attendees: Array.isArray(ev.extendedProps?.attendees) ? ev.extendedProps.attendees : []
@@ -1245,6 +1363,7 @@
       start: ecEvent.start,
       end: ecEvent.end,
       location: ecEvent.extendedProps?.location || '',
+      locationUrl: ecEvent.extendedProps?.locationUrl || '',
       description: ecEvent.extendedProps?.description || '',
       organizer: ecEvent.extendedProps?.organizer || null,
       attendees: Array.isArray(ecEvent.extendedProps?.attendees)
@@ -2094,17 +2213,70 @@
             </span>
           </label>
 
-          <label class="field">
+          <div class="field attendee-field">
             <span>
               Location {eventForm.create_zoom ? '(will be replaced with Zoom Join URL)' : ''}
+              {#if locationLoading && !eventForm.create_zoom}
+                <small class="field-hint">(Searching MapQuest...)</small>
+              {/if}
             </span>
-            <input
-              type="text"
-              bind:value={eventForm.location}
-              placeholder={eventForm.create_zoom ? 'Zoom link generated automatically' : 'Room / URL'}
-              disabled={savingEvent || eventForm.create_zoom}
-            />
-          </label>
+            <div class="attendee-input-wrapper">
+              <input
+                type="text"
+                value={eventForm.location}
+                on:input={handleLocationInput}
+                on:focus={() => {
+                  if (locationSuggestions.length > 0) {
+                    locationDropdownOpen = true;
+                  }
+                }}
+                on:blur={() => {
+                  setTimeout(() => {
+                    locationDropdownOpen = false;
+                  }, 160);
+                }}
+                on:keydown={handleLocationKeydown}
+                placeholder={eventForm.create_zoom
+                  ? 'Zoom link generated automatically'
+                  : 'Search address, place, or paste URL...'}
+                disabled={savingEvent || eventForm.create_zoom}
+                autocomplete="off"
+              />
+
+              {#if !eventForm.create_zoom && locationDropdownOpen && locationSuggestions.length > 0}
+                <ul class="contact-suggestions" role="listbox">
+                  {#each locationSuggestions as suggestion, idx (suggestion.display + idx)}
+                    <li>
+                      <button
+                        type="button"
+                        class="contact-suggestion-btn"
+                        class:contact-suggestion-active={idx === locationHighlightIndex}
+                        on:mousedown|preventDefault={() => selectLocationSuggestion(suggestion)}
+                      >
+                        <span class="contact-suggestion-name">📍 {suggestion.display}</span>
+                        <span class="contact-suggestion-email">
+                          {suggestion.type === 'poi' ? 'Place' : 'Address'}
+                        </span>
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+
+            {#if !eventForm.create_zoom && eventForm.location.trim() && !isUrl(eventForm.location)}
+              <div class="location-mapquest-preview">
+                <a
+                  href={buildMapQuestUrl(eventForm.location, eventForm.location_url)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="mapquest-inline-link"
+                >
+                  📍 Preview on MapQuest &nearr;
+                </a>
+              </div>
+            {/if}
+          </div>
 
           <div class="field attendee-field">
             <span>
@@ -2276,7 +2448,16 @@
                   {selectedEvent.location}
                 </a>
               {:else}
-                <span>{selectedEvent.location}</span>
+                <a
+                  href={buildMapQuestUrl(selectedEvent.location, selectedEvent.locationUrl)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="zoom-link mapquest-detail-link"
+                  title="Open address in MapQuest"
+                >
+                  <span>📍 {selectedEvent.location}</span>
+                  <span class="mapquest-tag">MapQuest &nearr;</span>
+                </a>
               {/if}
             </div>
           {/if}
@@ -2334,8 +2515,17 @@
               class="btn btn-danger"
               on:click={handleDeleteEvent}
               disabled={deletingEvent}
+              title={selectedEvent.attendees?.length
+                ? 'Deletes event and notifies invitees via Thundermail'
+                : 'Delete event'}
             >
-              {deletingEvent ? 'Deleting...' : 'Delete Event'}
+              {#if deletingEvent}
+                Deleting...
+              {:else if selectedEvent.attendees && selectedEvent.attendees.length > 0}
+                Cancel &amp; Notify Invitees
+              {:else}
+                Delete Event
+              {/if}
             </button>
           {/if}
           <div class="modal-actions-right">
@@ -3124,6 +3314,43 @@
   .zoom-link {
     color: var(--link-color);
     word-break: break-all;
+  }
+
+  .mapquest-detail-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    word-break: normal;
+    text-decoration: none;
+  }
+
+  .mapquest-detail-link:hover {
+    text-decoration: underline;
+  }
+
+  .mapquest-tag {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    background: var(--pill-bg);
+    color: var(--pill-text);
+    text-decoration: none;
+  }
+
+  .location-mapquest-preview {
+    margin-top: 0.15rem;
+  }
+
+  .mapquest-inline-link {
+    font-size: 0.78rem;
+    color: var(--link-color);
+    text-decoration: none;
+  }
+
+  .mapquest-inline-link:hover {
+    text-decoration: underline;
   }
 
   .detail-description pre {

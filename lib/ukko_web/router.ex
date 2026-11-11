@@ -43,6 +43,7 @@ defmodule UkkoWeb.Router do
     get "/feed-token", EventController, :get_feed_token
     post "/feed-token/rotate", EventController, :rotate_feed_token
     get "/contacts", EventController, :list_contacts
+    get "/locations/autocomplete", EventController, :autocomplete_locations
   end
 
   scope "/", UkkoWeb do

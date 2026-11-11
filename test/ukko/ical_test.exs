@@ -1,7 +1,7 @@
 defmodule Ukko.ICalTest do
   use ExUnit.Case, async: true
 
-  alias Ukko.{CalDAV, CardDAV, ICal, Zoom}
+  alias Ukko.{CalDAV, CardDAV, ICal, MapQuest, Zoom}
 
   test "builds and parses a VEVENT payload round-trip" do
     uid = ICal.generate_uid()
@@ -151,5 +151,42 @@ defmodule Ukko.ICalTest do
              "89876543210"
 
     assert Zoom.extract_meeting_id("Conference Room B", "Regular team sync") == nil
+  end
+
+  test "parses MapQuest Search Ahead predictions and round-trips locationUrl in ICal" do
+    raw_results = [
+      %{
+        "displayString" => "1600 Pennsylvania Ave, Charleston, WV 25302, United States",
+        "name" => "1600 Pennsylvania Ave",
+        "recordType" => "address",
+        "slug" => "/us/wv/charleston/25302-3932/1600-pennsylvania-ave-38.36025,-81.62115"
+      }
+    ]
+
+    assert [
+             %{
+               display: "1600 Pennsylvania Ave, Charleston, WV 25302, United States",
+               type: "address",
+               url:
+                 "https://www.mapquest.com/us/wv/charleston/25302-3932/1600-pennsylvania-ave-38.36025,-81.62115"
+             }
+           ] = MapQuest.parse_prediction_results(raw_results)
+
+    ics =
+      ICal.build_ics(%{
+        uid: "mq-evt-1",
+        title: "Coffee Meetup",
+        start: "2026-11-12T18:00:00Z",
+        end: "2026-11-12T19:00:00Z",
+        location: "1600 Pennsylvania Ave, Charleston, WV 25302",
+        location_url:
+          "https://www.mapquest.com/us/wv/charleston/25302-3932/1600-pennsylvania-ave-38.36025,-81.62115"
+      })
+
+    assert [event] = ICal.parse_vevents(ics)
+    assert event.location == "1600 Pennsylvania Ave, Charleston, WV 25302"
+
+    assert event.locationUrl ==
+             "https://www.mapquest.com/us/wv/charleston/25302-3932/1600-pennsylvania-ave-38.36025,-81.62115"
   end
 end

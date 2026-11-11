@@ -9,6 +9,7 @@ config :ukko,
   zoom_account_id: System.get_env("ZOOM_ACCOUNT_ID"),
   zoom_client_id: System.get_env("ZOOM_CLIENT_ID"),
   zoom_client_secret: System.get_env("ZOOM_CLIENT_SECRET"),
+  mapquest_api_key: System.get_env("MAPQUEST_API_KEY") || "qnBoTBAt8yIBYNHA3CEV4XMBskNGR94D",
   ukko_passcode: System.get_env("UKKO_PASSCODE")
 
 if System.get_env("PHX_SERVER") do

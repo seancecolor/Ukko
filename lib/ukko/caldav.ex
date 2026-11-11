@@ -163,14 +163,22 @@ defmodule Ukko.CalDAV do
 
   @doc """
   Deletes a calendar event on the CalDAV server via `DELETE <caldav_url><uid>.ics`.
+  Explicitly includes RFC 6638 `Schedule-Reply: T` so Thundermail/Stalwart sends
+  iTIP/iMIP cancellation notices to attendees (or a Declined reply if deleting an invite).
   """
   def delete_event(uid) when is_binary(uid) do
     with {:ok, cfg} <- get_config() do
       event_url = build_event_url(cfg.url, uid)
+      sched_headers = [{"schedule-reply", "T"}]
 
       case Req.delete(event_url,
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-             decode_body: false
+             headers: sched_headers,
+             decode_body: false,
+             receive_timeout: 25_000,
+             connect_options: [timeout: 15_000],
+             retry: :transient,
+             max_retries: 2
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 202, 204] ->
           :ok
@@ -178,7 +186,13 @@ defmodule Ukko.CalDAV do
         {:ok, %Req.Response{status: 404}} ->
           if String.contains?(uid, "@") do
             alt_url = build_event_url(cfg.url, String.replace(uid, "@", "_"))
-            _ = Req.delete(alt_url, auth: {:basic, "#{cfg.user}:#{cfg.pass}"}, decode_body: false)
+
+            _ =
+              Req.delete(alt_url,
+                auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+                headers: sched_headers,
+                decode_body: false
+              )
           end
 
           :ok

@@ -274,6 +274,7 @@ defmodule Ukko.ICal do
         summary = get_prop_text(props, "SUMMARY") || "(No Title)"
         description = get_prop_text(props, "DESCRIPTION") || ""
         location = get_prop_text(props, "LOCATION") || ""
+        location_url = get_prop_raw(props, "X-UKKO-LOCATION-URL")
         rrule_str = get_prop_raw(props, "RRULE")
         dtend_info = parse_dt_prop(Map.get(props, "DTEND"), vtimezones)
         duration_sec = parse_duration_seconds(get_prop_raw(props, "DURATION"))
@@ -297,6 +298,7 @@ defmodule Ukko.ICal do
           summary: summary,
           description: description,
           location: location,
+          location_url: location_url,
           dtstart: dtstart_info,
           dtend: dtend_info,
           duration_sec: duration_sec,
@@ -1003,6 +1005,7 @@ defmodule Ukko.ICal do
       allDay: all_day,
       description: ev.description,
       location: ev.location,
+      locationUrl: Map.get(ev, :location_url),
       organizer: Map.get(ev, :organizer),
       attendees: Map.get(ev, :attendees, []),
       readOnly: read_only,
@@ -1012,6 +1015,7 @@ defmodule Ukko.ICal do
         uid: ev.uid,
         description: ev.description,
         location: ev.location,
+        locationUrl: Map.get(ev, :location_url),
         organizer: Map.get(ev, :organizer),
         attendees: Map.get(ev, :attendees, []),
         readOnly: read_only,
@@ -1318,6 +1322,7 @@ defmodule Ukko.ICal do
   def build_ics(%{uid: uid, title: title, start: start_iso, end: end_iso} = attrs) do
     description = Map.get(attrs, :description) || ""
     location = Map.get(attrs, :location) || ""
+    location_url = Map.get(attrs, :location_url)
     attendees = normalize_attendees(Map.get(attrs, :attendees) || [])
     organizer_email =
       Map.get(attrs, :organizer_email) ||
@@ -1327,6 +1332,13 @@ defmodule Ukko.ICal do
     dtstamp = iso8601_to_ical_utc(DateTime.utc_now())
     dtstart = format_dt_prop("DTSTART", start_iso)
     dtend = format_dt_prop("DTEND", end_iso || start_iso)
+
+    location_url_lines =
+      if is_binary(location_url) and String.trim(location_url) != "" do
+        ["X-UKKO-LOCATION-URL:#{String.trim(location_url)}"]
+      else
+        []
+      end
 
     participant_lines = build_participant_lines(organizer_email, attendees)
 
@@ -1345,6 +1357,7 @@ defmodule Ukko.ICal do
         "DESCRIPTION:#{escape_text(description)}",
         "LOCATION:#{escape_text(location)}"
       ] ++
+        location_url_lines ++
         participant_lines ++
         [
           "END:VEVENT",

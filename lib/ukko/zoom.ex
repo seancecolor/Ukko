@@ -96,6 +96,35 @@ defmodule Ukko.Zoom do
   end
 
   @doc """
+  Deletes/cancels an existing Zoom meeting via `DELETE /v2/meetings/:meeting_id`.
+  """
+  def delete_meeting(meeting_id) when is_binary(meeting_id) or is_integer(meeting_id) do
+    clean_id = meeting_id |> to_string() |> String.replace(~r/[^\d]/, "")
+
+    if clean_id == "" do
+      {:error, :invalid_meeting_id}
+    else
+      with {:ok, token} <- get_access_token() do
+        url = "#{@meeting_base_url}/#{clean_id}"
+
+        case Req.delete(url,
+               auth: {:bearer, token},
+               params: [schedule_for_reminder: true]
+             ) do
+          {:ok, %Req.Response{status: status}} when status in [200, 204, 404] ->
+            :ok
+
+          {:ok, %Req.Response{status: status, body: body}} ->
+            {:error, {:zoom_api_error, status, body}}
+
+          {:error, exception} ->
+            {:error, exception}
+        end
+      end
+    end
+  end
+
+  @doc """
   Extracts a Zoom numeric Meeting ID from an event's `location` or `description`
   (matching either `Meeting ID: 1234567890` or a `https://...zoom.us/j/1234567890` URL).
   Returns `nil` if no Zoom meeting is attached.
