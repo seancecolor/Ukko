@@ -230,6 +230,10 @@ defmodule UkkoWeb.EventController do
     description = Map.get(params, "description") || ""
     location = Map.get(params, "location") || ""
     raw_location_url = Map.get(params, "location_url")
+    rrule = Map.get(params, "rrule")
+    timezone = Map.get(params, "timezone")
+    edit_scope = Map.get(params, "edit_scope")
+    recurrence_id = Map.get(params, "recurrence_id") || Map.get(params, "occurrence_start")
     attendees = ICal.normalize_attendees(Map.get(params, "attendees") || [])
     create_zoom = truthy?(Map.get(params, "create_zoom", false))
 
@@ -246,29 +250,41 @@ defmodule UkkoWeb.EventController do
         description: description,
         location: location,
         location_url: MapQuest.resolve_location_url(location, raw_location_url),
+        rrule: rrule,
+        timezone: timezone,
         attendees: attendees
       }
 
       is_update = success_status == :ok
+      sync_zoom_on_update = is_update and edit_scope != "single"
 
-      with {:ok, enriched_attrs} <- maybe_sync_zoom(base_attrs, create_zoom, is_update),
-           {:ok, ^uid} <- CalDAV.put_event(enriched_attrs) do
+      with {:ok, enriched_attrs} <- maybe_sync_zoom(base_attrs, create_zoom, sync_zoom_on_update),
+           {:ok, saved_uid, final_attendees} <-
+             persist_event_save(uid, enriched_attrs, is_update, edit_scope, recurrence_id) do
+        is_rec =
+          is_binary(enriched_attrs[:rrule]) and String.trim(enriched_attrs[:rrule]) != "" and
+            edit_scope != "single"
+
         event_response = %{
-          id: uid,
-          uid: uid,
+          id: saved_uid,
+          uid: saved_uid,
           title: enriched_attrs.title,
           start: enriched_attrs.start,
           end: enriched_attrs.end,
           description: enriched_attrs.description,
           location: enriched_attrs.location,
           locationUrl: enriched_attrs.location_url,
-          attendees: enriched_attrs.attendees,
+          isRecurring: is_rec,
+          rrule: enriched_attrs[:rrule] || "",
+          attendees: final_attendees,
           extendedProps: %{
-            uid: uid,
+            uid: saved_uid,
             description: enriched_attrs.description,
             location: enriched_attrs.location,
             locationUrl: enriched_attrs.location_url,
-            attendees: enriched_attrs.attendees
+            isRecurring: is_rec,
+            rrule: enriched_attrs[:rrule] || "",
+            attendees: final_attendees
           }
         }
 
@@ -295,17 +311,91 @@ defmodule UkkoWeb.EventController do
     end
   end
 
+  defp persist_event_save(uid, enriched_attrs, true, edit_scope, recurrence_id)
+       when edit_scope in ["single", "following"] do
+    case CalDAV.get_event_resource(uid) do
+      {:ok, %{url: resource_url, ics: raw_ics}} ->
+        case ICal.apply_recurring_edit(raw_ics, edit_scope, recurrence_id, enriched_attrs) do
+          {:single_put, updated_ics, final_attendees} ->
+            case CalDAV.put_raw_ics_to_url(resource_url, updated_ics) do
+              :ok -> {:ok, uid, final_attendees}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:split_put, truncated_ics, new_uid, new_series_ics, final_attendees} ->
+            with :ok <- CalDAV.put_raw_ics_to_url(resource_url, truncated_ics),
+                  {:ok, ^new_uid} <- CalDAV.put_raw_ics(new_uid, new_series_ics) do
+              {:ok, new_uid, final_attendees}
+            end
+        end
+
+      {:error, :not_found} ->
+        final_attendees = ICal.reset_attendees_to_pending(enriched_attrs.attendees)
+        updated_attrs = %{enriched_attrs | attendees: final_attendees}
+
+        case CalDAV.put_event(updated_attrs) do
+          {:ok, saved_uid} -> {:ok, saved_uid, final_attendees}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp persist_event_save(uid, enriched_attrs, true, _edit_scope, _recurrence_id) do
+    case CalDAV.get_event_resource(uid) do
+      {:ok, %{url: resource_url, ics: raw_ics}} ->
+        {ics_payload, final_attendees} = ICal.prepare_single_event_update(raw_ics, enriched_attrs)
+
+        case CalDAV.put_raw_ics_to_url(resource_url, ics_payload) do
+          :ok -> {:ok, uid, final_attendees}
+          {:error, reason} -> {:error, reason}
+        end
+
+      _ ->
+        final_attendees = ICal.reset_attendees_to_pending(enriched_attrs.attendees)
+        updated_attrs = %{enriched_attrs | attendees: final_attendees}
+
+        case CalDAV.put_event(updated_attrs) do
+          {:ok, saved_uid} -> {:ok, saved_uid, final_attendees}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp persist_event_save(_uid, enriched_attrs, false, _edit_scope, _recurrence_id) do
+    final_attendees = ICal.reset_attendees_to_pending(enriched_attrs.attendees)
+    new_attrs = %{enriched_attrs | attendees: final_attendees}
+
+    case CalDAV.put_event(new_attrs) do
+      {:ok, saved_uid} -> {:ok, saved_uid, final_attendees}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @doc """
   DELETE /api/events/:uid
+  Supports optional `scope` (`"single"` | `"following"` | `"all"`) and `recurrence_id` query params
+  when deleting occurrences of a recurring event.
   """
-  def delete(conn, %{"uid" => uid}) do
-    maybe_cancel_attached_zoom(uid)
+  def delete(conn, %{"uid" => uid} = params) do
+    scope = Map.get(params, "scope")
+    recurrence_id = Map.get(params, "recurrence_id")
 
-    case CalDAV.delete_event(uid) do
+    result =
+      if scope in ["single", "following"] do
+        delete_recurring_occurrence(uid, scope, recurrence_id)
+      else
+        maybe_cancel_attached_zoom(uid)
+        CalDAV.delete_event(uid)
+      end
+
+    case result do
       :ok ->
         conn
         |> put_status(:ok)
-        |> json(%{deleted: true, uid: uid})
+        |> json(%{deleted: true, uid: uid, scope: scope || "all"})
 
       {:error, reason} ->
         conn
@@ -314,6 +404,26 @@ defmodule UkkoWeb.EventController do
           error: "Failed to delete event from CalDAV",
           details: format_reason(reason)
         })
+    end
+  end
+
+  defp delete_recurring_occurrence(uid, scope, recurrence_id) do
+    case CalDAV.get_event_resource(uid) do
+      {:ok, %{url: resource_url, ics: raw_ics}} ->
+        case ICal.apply_recurring_delete(raw_ics, scope, recurrence_id) do
+          {:single_put, updated_ics} ->
+            CalDAV.put_raw_ics_to_url(resource_url, updated_ics)
+
+          :delete_all ->
+            maybe_cancel_attached_zoom(uid)
+            CalDAV.delete_event(uid)
+        end
+
+      {:error, :not_found} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

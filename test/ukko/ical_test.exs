@@ -229,4 +229,149 @@ defmodule Ukko.ICalTest do
     assert healed_ev.locationUrl ==
              "https://www.mapquest.com/us/ca/montebello/90640-4948/509-work-st-34.00752,-118.12667"
   end
+
+  test "apply_recurring_edit modifies a single occurrence or splits this-and-following occurrences and resets invitees to NEEDS-ACTION" do
+    master_ics =
+      ICal.build_ics(%{
+        uid: "rec-series-1",
+        title: "Weekly Standup",
+        start: "2026-11-04T17:00:00Z",
+        end: "2026-11-04T17:30:00Z",
+        rrule: "FREQ=WEEKLY;BYDAY=WE",
+        organizer_email: "host@thundermail.com",
+        attendees: [%{name: "Nicole", email: "nicole@example.com", status: "ACCEPTED"}]
+      })
+
+    initial_events =
+      ICal.parse_vevents(master_ics, "2026-11-01T00:00:00Z", "2026-11-30T00:00:00Z")
+
+    assert Enum.map(initial_events, & &1.start) == [
+             "2026-11-04T17:00:00Z",
+             "2026-11-11T17:00:00Z",
+             "2026-11-18T17:00:00Z",
+             "2026-11-25T17:00:00Z"
+           ]
+
+    assert Enum.all?(initial_events, &(&1.isRecurring == true))
+
+    # 1. Single-occurrence override: move Nov 18 (Wed) -> Nov 19 (Thu)
+    {:single_put, single_override_ics, single_attendees} =
+      ICal.apply_recurring_edit(master_ics, "single", "2026-11-18T17:00:00Z", %{
+        uid: "rec-series-1",
+        title: "Moved Standup",
+        start: "2026-11-19T18:00:00Z",
+        end: "2026-11-19T18:30:00Z",
+        description: "",
+        location: "",
+        attendees: [%{name: "Nicole", email: "nicole@example.com", status: "ACCEPTED"}]
+      })
+
+    assert [%{email: "nicole@example.com", status: "NEEDS-ACTION"}] = single_attendees
+
+    single_events =
+      single_override_ics
+      |> ICal.parse_vevents("2026-11-01T00:00:00Z", "2026-11-30T00:00:00Z")
+      |> Enum.sort_by(& &1.start)
+
+    assert Enum.map(single_events, &{&1.title, &1.start, hd(&1.attendees).status}) == [
+             {"Weekly Standup", "2026-11-04T17:00:00Z", "ACCEPTED"},
+             {"Weekly Standup", "2026-11-11T17:00:00Z", "ACCEPTED"},
+             {"Moved Standup", "2026-11-19T18:00:00Z", "NEEDS-ACTION"},
+             {"Weekly Standup", "2026-11-25T17:00:00Z", "ACCEPTED"}
+           ]
+
+    # 2. This and following occurrences: move Nov 18 onward to Thursdays at 19:00Z
+    {:split_put, truncated_ics, _new_uid, new_series_ics, following_attendees} =
+      ICal.apply_recurring_edit(master_ics, "following", "2026-11-18T17:00:00Z", %{
+        uid: "rec-series-1",
+        title: "Thursday Sync",
+        start: "2026-11-19T19:00:00Z",
+        end: "2026-11-19T19:30:00Z",
+        rrule: "FREQ=WEEKLY;BYDAY=WE",
+        description: "",
+        location: "",
+        attendees: [%{name: "Nicole", email: "nicole@example.com", status: "ACCEPTED"}]
+      })
+
+    assert [%{email: "nicole@example.com", status: "NEEDS-ACTION"}] = following_attendees
+
+    prior_events =
+      ICal.parse_vevents(truncated_ics, "2026-11-01T00:00:00Z", "2026-11-30T00:00:00Z")
+
+    following_events =
+      ICal.parse_vevents(new_series_ics, "2026-11-01T00:00:00Z", "2026-11-30T00:00:00Z")
+
+    assert Enum.map(prior_events, &{&1.title, &1.start, hd(&1.attendees).status}) == [
+             {"Weekly Standup", "2026-11-04T17:00:00Z", "ACCEPTED"},
+             {"Weekly Standup", "2026-11-11T17:00:00Z", "ACCEPTED"}
+           ]
+
+    assert Enum.map(following_events, &{&1.title, &1.start, hd(&1.attendees).status}) == [
+             {"Thursday Sync", "2026-11-19T19:00:00Z", "NEEDS-ACTION"},
+             {"Thursday Sync", "2026-11-26T19:00:00Z", "NEEDS-ACTION"}
+           ]
+  end
+
+  test "prepare_single_event_update increments SEQUENCE and resets invitees to NEEDS-ACTION when event changes" do
+    initial_ics =
+      ICal.build_ics(%{
+        uid: "single-evt-1",
+        title: "Client Review",
+        start: "2026-11-12T18:00:00Z",
+        end: "2026-11-12T19:00:00Z",
+        organizer_email: "host@thundermail.com",
+        attendees: [%{name: "Alex", email: "alex@example.com", status: "ACCEPTED"}]
+      })
+
+    {updated_ics, final_attendees} =
+      ICal.prepare_single_event_update(initial_ics, %{
+        uid: "single-evt-1",
+        title: "Client Review",
+        start: "2026-11-12T19:30:00Z",
+        end: "2026-11-12T20:30:00Z",
+        description: "",
+        location: "",
+        attendees: [%{name: "Alex", email: "alex@example.com", status: "ACCEPTED"}]
+      })
+
+    assert [%{email: "alex@example.com", status: "NEEDS-ACTION"}] = final_attendees
+    assert updated_ics =~ "SEQUENCE:1"
+    assert [parsed] = ICal.parse_vevents(updated_ics)
+    assert [%{email: "alex@example.com", status: "NEEDS-ACTION"}] = parsed.attendees
+  end
+
+  test "creates TZID recurring series across evening local time and deletes single occurrence via EXDATE" do
+    # Wednesday Nov 11, 2026 at 6:00 PM PST = 2026-11-12T02:00:00Z
+    ics =
+      ICal.build_ics(%{
+        uid: "pst-rec-1",
+        title: "Evening Check-in",
+        start: "2026-11-12T02:00:00Z",
+        end: "2026-11-12T02:30:00Z",
+        timezone: "America/Los_Angeles",
+        rrule: "FREQ=WEEKLY;COUNT=3"
+      })
+
+    assert ics =~ "BEGIN:VTIMEZONE"
+    assert ics =~ "DTSTART;TZID=America/Los_Angeles:20261111T180000"
+
+    events = ICal.parse_vevents(ics, "2026-11-01T00:00:00Z", "2026-12-05T00:00:00Z")
+
+    assert Enum.map(events, & &1.start) == [
+             "2026-11-12T02:00:00Z",
+             "2026-11-19T02:00:00Z",
+             "2026-11-26T02:00:00Z"
+           ]
+
+    {:single_put, after_single_delete_ics} =
+      ICal.apply_recurring_delete(ics, "single", "2026-11-19T02:00:00Z")
+
+    remaining =
+      ICal.parse_vevents(after_single_delete_ics, "2026-11-01T00:00:00Z", "2026-12-05T00:00:00Z")
+
+    assert Enum.map(remaining, & &1.start) == [
+             "2026-11-12T02:00:00Z",
+             "2026-11-26T02:00:00Z"
+           ]
+  end
 end

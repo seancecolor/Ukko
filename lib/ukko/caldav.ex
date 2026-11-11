@@ -60,7 +60,20 @@ defmodule Ukko.CalDAV do
     with {:ok, cfg} <- get_config() do
       event_url = build_event_url(cfg.url, uid)
 
-      case Req.put(event_url,
+      case put_raw_ics_to_url(event_url, ics_payload) do
+        :ok -> {:ok, uid}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Uploads a raw `.ics` payload directly to a resolved CalDAV resource URL.
+  """
+  def put_raw_ics_to_url(resource_url, ics_payload)
+      when is_binary(resource_url) and is_binary(ics_payload) do
+    with {:ok, cfg} <- get_config() do
+      case Req.put(resource_url,
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
              headers: [{"content-type", "text/calendar; charset=utf-8"}],
              body: ics_payload,
@@ -71,7 +84,7 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 201, 204] ->
-          {:ok, uid}
+          :ok
 
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {:caldav_error, status, body}}
@@ -85,9 +98,21 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Fetches a raw `.ics` resource by `uid` from `<caldav_url><uid>.ics`.
+  Fetches a raw `.ics` resource by `uid`, returning `{:ok, raw_ics}`.
   """
   def get_raw_ics(uid) when is_binary(uid) do
+    case get_event_resource(uid) do
+      {:ok, %{ics: ics}} -> {:ok, ics}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Resolves a CalDAV event by `uid`, trying direct `GET <caldav_url><uid>.ics` first and
+  falling back to a `REPORT` UID `prop-filter` lookup when the resource filename differs
+  from `<uid>.ics`. Returns `{:ok, %{url: resolved_url, ics: raw_ics}}`.
+  """
+  def get_event_resource(uid) when is_binary(uid) do
     with {:ok, cfg} <- get_config() do
       event_url = build_event_url(cfg.url, uid)
 
@@ -100,10 +125,10 @@ defmodule Ukko.CalDAV do
              max_retries: 1
            ) do
         {:ok, %Req.Response{status: 200, body: body}} ->
-          {:ok, to_string(body)}
+          {:ok, %{url: event_url, ics: to_string(body)}}
 
         {:ok, %Req.Response{status: 404}} ->
-          {:error, :not_found}
+          lookup_event_resource_by_uid(cfg, uid)
 
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {:caldav_error, status, body}}
@@ -184,18 +209,31 @@ defmodule Ukko.CalDAV do
           :ok
 
         {:ok, %Req.Response{status: 404}} ->
-          if String.contains?(uid, "@") do
-            alt_url = build_event_url(cfg.url, String.replace(uid, "@", "_"))
+          case lookup_event_resource_by_uid(cfg, uid) do
+            {:ok, %{url: resolved_url}} ->
+              _ =
+                Req.delete(resolved_url,
+                  auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+                  headers: sched_headers,
+                  decode_body: false
+                )
 
-            _ =
-              Req.delete(alt_url,
-                auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-                headers: sched_headers,
-                decode_body: false
-              )
+              :ok
+
+            _ ->
+              if String.contains?(uid, "@") do
+                alt_url = build_event_url(cfg.url, String.replace(uid, "@", "_"))
+
+                _ =
+                  Req.delete(alt_url,
+                    auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+                    headers: sched_headers,
+                    decode_body: false
+                  )
+              end
+
+              :ok
           end
-
-          :ok
 
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {:caldav_error, status, body}}
@@ -384,6 +422,76 @@ defmodule Ukko.CalDAV do
       |> String.replace("@caldav-import", "_caldav-import")
 
     "#{normalized_base}#{URI.encode(clean_uid)}.ics"
+  end
+
+  defp lookup_event_resource_by_uid(cfg, uid) do
+    escaped_uid =
+      uid
+      |> String.replace("&", "&amp;")
+      |> String.replace("<", "&lt;")
+      |> String.replace(">", "&gt;")
+      |> String.replace("\"", "&quot;")
+
+    xml_body = """
+    <?xml version="1.0" encoding="utf-8" ?>
+    <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+      <D:prop>
+        <D:getetag/>
+        <C:calendar-data/>
+      </D:prop>
+      <C:filter>
+        <C:comp-filter name="VCALENDAR">
+          <C:comp-filter name="VEVENT">
+            <C:prop-filter name="UID">
+              <C:text-match collation="i;octet">#{escaped_uid}</C:text-match>
+            </C:prop-filter>
+          </C:comp-filter>
+        </C:comp-filter>
+      </C:filter>
+    </C:calendar-query>
+    """
+
+    case Req.request(
+           method: "REPORT",
+           url: cfg.url,
+           auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+           headers: [
+             {"depth", "1"},
+             {"content-type", "application/xml; charset=utf-8"}
+           ],
+           body: xml_body,
+           decode_body: false,
+           receive_timeout: 20_000,
+           connect_options: [timeout: 10_000]
+         ) do
+      {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
+        responses = xpath(to_string(body), ~x"//*[local-name()='response']"l)
+
+        found =
+          Enum.find_value(responses, fn resp ->
+            href = resp |> xpath(~x"./*[local-name()='href']/text()"s) |> String.trim()
+            ics = resp |> xpath(~x".//*[local-name()='calendar-data']/text()"ls) |> Enum.join("")
+
+            if href != "" and String.trim(ics) != "" do
+              resolved = URI.merge(URI.parse(cfg.url), href) |> URI.to_string()
+              %{url: resolved, ics: ics}
+            else
+              nil
+            end
+          end)
+
+        if found, do: {:ok, found}, else: {:error, :not_found}
+
+      {:ok, %Req.Response{status: status, body: body}} ->
+        {:error, {:caldav_error, status, body}}
+
+      {:error, exception} ->
+        {:error, exception}
+    end
+  rescue
+    _ -> {:error, :not_found}
+  catch
+    :exit, _ -> {:error, :not_found}
   end
 
   defp get_config do

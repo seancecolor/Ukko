@@ -74,7 +74,7 @@
       : '';
 
   // App version state
-  let appVersion = '0.1.7';
+  let appVersion = '0.1.8';
 
   // Animating ASCII art state for THUNDERCAL
   const ASCII_THUNDER_BASE = [
@@ -170,8 +170,24 @@
   let locationDebounceTimer = null;
 
   // Create / Edit Event modal state
+  const RRULE_PRESETS = [
+    { value: '', label: 'Does not repeat' },
+    { value: 'FREQ=DAILY', label: 'Daily' },
+    { value: 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR', label: 'Every weekday (Mon–Fri)' },
+    { value: 'FREQ=WEEKLY', label: 'Weekly' },
+    { value: 'FREQ=WEEKLY;INTERVAL=2', label: 'Every 2 weeks' },
+    { value: 'FREQ=MONTHLY', label: 'Monthly' },
+    { value: 'FREQ=YEARLY', label: 'Yearly' }
+  ];
+
   let showEventModal = false;
   let editingUid = null;
+  let editingIsRecurring = false;
+  let editingRecurrenceId = '';
+  let editingOriginalRrule = '';
+  let repeatEndType = 'never'; // 'never' | 'until' | 'count'
+  let repeatUntilDate = '';
+  let repeatCount = 10;
   let savingEvent = false;
   let formError = '';
   let eventForm = {
@@ -179,12 +195,25 @@
     start: '',
     end: '',
     all_day: false,
+    rrule: '',
     location: '',
     location_url: '',
     description: '',
     create_zoom: false,
     attendees: []
   };
+
+  // Recurring event edit / delete scope confirmation popup state
+  let showRecurringScopeModal = false;
+  let recurringEditScope = 'single'; // 'single' | 'following'
+  let pendingRecurringChange = null;
+  let applyingRecurringChange = false;
+  let recurringScopeError = '';
+
+  let showRecurringDeleteModal = false;
+  let recurringDeleteScope = 'single'; // 'single' | 'following' | 'all'
+  let deletingRecurringScope = false;
+  let recurringDeleteError = '';
 
   $: allKnownContacts = (() => {
     const map = new Map();
@@ -525,6 +554,9 @@
             const rawEnd = ev.end || ev.start;
             const bgColor = ev.backgroundColor || ev.color || ev.extendedProps?.color;
             const readOnly = Boolean(ev.readOnly || ev.extendedProps?.readOnly);
+            const isRecurring = Boolean(ev.isRecurring || ev.extendedProps?.isRecurring);
+            const rrule = ev.rrule ?? ev.extendedProps?.rrule ?? '';
+            const recurrenceId = ev.recurrenceId ?? ev.extendedProps?.recurrenceId ?? '';
             const calendarName =
               ev.calendarName || ev.extendedProps?.calendarName || 'Thundercal';
 
@@ -549,6 +581,9 @@
                   : Array.isArray(ev.extendedProps?.attendees)
                     ? ev.extendedProps.attendees
                     : [],
+                isRecurring,
+                rrule,
+                recurrenceId,
                 readOnly,
                 calendarName,
                 color: bgColor || '#2563eb'
@@ -1000,7 +1035,7 @@
     if (s === 'ACCEPTED') return 'Accepted';
     if (s === 'DECLINED') return 'Declined';
     if (s === 'TENTATIVE') return 'Tentative';
-    return 'Invited';
+    return 'Pending';
   }
 
   function sanitizeMapQuestUrl(rawUrl) {
@@ -1115,6 +1150,168 @@
 
   // --- Create / Edit / Delete Events ---
 
+  function getBrowserTimeZone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Los_Angeles';
+    } catch {
+      return 'America/Los_Angeles';
+    }
+  }
+
+  function defaultRepeatUntilDate(startInputVal) {
+    const base = startInputVal ? new Date(startInputVal) : new Date();
+    const d = Number.isNaN(base.getTime()) ? new Date() : new Date(base.getTime());
+    d.setMonth(d.getMonth() + 3);
+    return toLocalInputValue(d).slice(0, 10);
+  }
+
+  function splitRruleForForm(rawRrule) {
+    const trimmed = (rawRrule || '').trim().replace(/^RRULE:/i, '').trim();
+    if (!trimmed) {
+      return { baseRrule: '', endType: 'never', untilDate: '', count: 10 };
+    }
+
+    const baseParts = [];
+    let endType = 'never';
+    let untilDate = '';
+    let count = 10;
+
+    for (const part of trimmed.split(';')) {
+      const [rawK, rawV] = part.split('=');
+      if (!rawK || rawV === undefined) continue;
+      const k = rawK.trim().toUpperCase();
+      const v = rawV.trim();
+
+      if (k === 'UNTIL') {
+        const digits = v.slice(0, 8);
+        if (/^\d{8}$/.test(digits)) {
+          endType = 'until';
+          untilDate = `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+        }
+      } else if (k === 'COUNT') {
+        const parsedCount = parseInt(v, 10);
+        if (parsedCount > 0) {
+          endType = 'count';
+          count = parsedCount;
+        }
+      } else {
+        baseParts.push(`${k}=${v}`);
+      }
+    }
+
+    return {
+      baseRrule: baseParts.join(';'),
+      endType,
+      untilDate,
+      count
+    };
+  }
+
+  function composeRruleFromForm(baseRrule, endType, untilDate, countVal, isAllDay) {
+    const cleanBase = (baseRrule || '')
+      .trim()
+      .split(';')
+      .filter((p) => {
+        const k = (p.split('=')[0] || '').trim().toUpperCase();
+        return k && k !== 'UNTIL' && k !== 'COUNT';
+      })
+      .join(';');
+
+    if (!cleanBase) return '';
+
+    if (endType === 'until' && /^\d{4}-\d{2}-\d{2}$/.test((untilDate || '').trim())) {
+      const dStr = untilDate.trim();
+      if (isAllDay) {
+        return `${cleanBase};UNTIL=${dStr.replace(/-/g, '')}`;
+      }
+      const [y, m, d] = dStr.split('-').map(Number);
+      const localEnd = new Date(y, m - 1, d, 23, 59, 59);
+      const utcUntil = localEnd
+        .toISOString()
+        .replace(/[-:]/g, '')
+        .replace(/\.\d{3}Z$/, 'Z');
+      return `${cleanBase};UNTIL=${utcUntil}`;
+    }
+
+    if (endType === 'count') {
+      const n = Math.max(1, Math.floor(Number(countVal) || 1));
+      return `${cleanBase};COUNT=${n}`;
+    }
+
+    return cleanBase;
+  }
+
+  function formatRruleSummary(rruleStr) {
+    if (!rruleStr || typeof rruleStr !== 'string') return 'Recurring';
+    const trimmed = rruleStr.trim();
+
+    const map = {};
+    const baseParts = [];
+    for (const part of trimmed.split(';')) {
+      const [k, v] = part.split('=');
+      if (k && v) {
+        const upK = k.trim().toUpperCase();
+        const cleanV = v.trim();
+        map[upK] = cleanV;
+        if (upK !== 'UNTIL' && upK !== 'COUNT') {
+          baseParts.push(`${upK}=${cleanV}`);
+        }
+      }
+    }
+
+    const baseJoined = baseParts.join(';');
+    const preset = RRULE_PRESETS.find((p) => p.value && p.value === baseJoined);
+
+    const freq = (map.FREQ || '').toUpperCase();
+    const interval = parseInt(map.INTERVAL || '1', 10) || 1;
+    let label = preset ? preset.label : 'Recurring';
+
+    if (!preset) {
+      if (freq === 'DAILY') {
+        label = interval > 1 ? `Every ${interval} days` : 'Daily';
+      } else if (freq === 'WEEKLY') {
+        label = interval > 1 ? `Every ${interval} weeks` : 'Weekly';
+        if (map.BYDAY) label += ` (${map.BYDAY})`;
+      } else if (freq === 'MONTHLY') {
+        label = interval > 1 ? `Every ${interval} months` : 'Monthly';
+      } else if (freq === 'YEARLY') {
+        label = interval > 1 ? `Every ${interval} years` : 'Yearly';
+      }
+    }
+
+    if (map.COUNT) {
+      const n = parseInt(map.COUNT, 10);
+      if (n > 0) label += ` • ${n} time${n === 1 ? '' : 's'}`;
+    } else if (map.UNTIL && map.UNTIL.length >= 8) {
+      const raw = map.UNTIL.slice(0, 8);
+      if (/^\d{8}$/.test(raw)) {
+        const y = Number(raw.slice(0, 4));
+        const m = Number(raw.slice(4, 6)) - 1;
+        const d = Number(raw.slice(6, 8));
+        const formatted = new Date(y, m, d).toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric'
+        });
+        label += ` • until ${formatted}`;
+      }
+    }
+
+    return label;
+  }
+
+  function isPresetRrule(rruleStr) {
+    return RRULE_PRESETS.some((p) => p.value === (rruleStr || '').trim());
+  }
+
+  function handleRepeatEndTypeChange(e) {
+    const next = e.target.value;
+    repeatEndType = next;
+    if (next === 'until' && !repeatUntilDate) {
+      repeatUntilDate = defaultRepeatUntilDate(eventForm.start);
+    }
+  }
+
   function openCreateModal(startDate, endDate, allDay = false) {
     const now = new Date();
     now.setMinutes(0, 0, 0);
@@ -1126,6 +1323,12 @@
       : new Date(start.getTime() + 60 * 60 * 1000);
 
     editingUid = null;
+    editingIsRecurring = false;
+    editingRecurrenceId = '';
+    editingOriginalRrule = '';
+    repeatEndType = 'never';
+    repeatUntilDate = defaultRepeatUntilDate(toLocalInputValue(start));
+    repeatCount = 10;
     attendeeQuery = '';
     attendeeDropdownOpen = false;
     attendeeHighlightIndex = 0;
@@ -1137,6 +1340,7 @@
       start: toLocalInputValue(start),
       end: toLocalInputValue(end),
       all_day: Boolean(allDay),
+      rrule: '',
       location: '',
       location_url: '',
       description: '',
@@ -1153,6 +1357,20 @@
   function openEditModal(ev) {
     if (!ev || ev.readOnly) return;
     editingUid = ev.uid;
+    editingIsRecurring = Boolean(ev.isRecurring);
+    editingRecurrenceId =
+      ev.recurrenceId ||
+      (ev.allDay
+        ? toLocalInputValue(ev.start).slice(0, 10)
+        : ev.start instanceof Date
+          ? ev.start.toISOString()
+          : String(ev.start || ''));
+    editingOriginalRrule = (ev.rrule || '').trim();
+    const parsedRepeat = splitRruleForForm(ev.rrule || '');
+    repeatEndType = parsedRepeat.endType;
+    repeatUntilDate =
+      parsedRepeat.untilDate || defaultRepeatUntilDate(toLocalInputValue(ev.start));
+    repeatCount = parsedRepeat.count;
     attendeeQuery = '';
     attendeeDropdownOpen = false;
     attendeeHighlightIndex = 0;
@@ -1164,6 +1382,7 @@
       start: toLocalInputValue(ev.start),
       end: toLocalInputValue(ev.end || ev.start),
       all_day: Boolean(ev.allDay),
+      rrule: parsedRepeat.baseRrule,
       location: ev.location || '',
       location_url: sanitizeMapQuestUrl(ev.locationUrl || ''),
       description: ev.description || '',
@@ -1179,9 +1398,12 @@
   }
 
   function closeEventModal() {
-    if (savingEvent) return;
+    if (savingEvent || applyingRecurringChange) return;
     showEventModal = false;
     editingUid = null;
+    editingIsRecurring = false;
+    editingRecurrenceId = '';
+    editingOriginalRrule = '';
     formError = '';
   }
 
@@ -1194,38 +1416,64 @@
       return;
     }
 
+    const isAllDay = Boolean(eventForm.all_day);
+    let startVal = localInputToIso(eventForm.start, isAllDay);
+    let endVal = localInputToIso(eventForm.end || eventForm.start, isAllDay);
+
+    if (isAllDay && startVal === endVal) {
+      const [y, m, d] = startVal.split('-').map(Number);
+      const nextDay = new Date(Date.UTC(y, m - 1, d + 1));
+      endVal = nextDay.toISOString().slice(0, 10);
+    }
+
+    if (attendeeQuery.trim()) {
+      const pending = parseTypedAttendee(attendeeQuery.trim());
+      if (pending) {
+        addAttendee(pending);
+      }
+    }
+
+    const composedRrule = composeRruleFromForm(
+      eventForm.rrule,
+      repeatEndType,
+      repeatUntilDate,
+      repeatCount,
+      isAllDay
+    );
+
+    const payload = {
+      title: eventForm.title.trim(),
+      start: startVal,
+      end: endVal,
+      timezone: getBrowserTimeZone(),
+      rrule: composedRrule,
+      location: eventForm.location.trim(),
+      location_url: eventForm.location_url || '',
+      description: eventForm.description.trim(),
+      create_zoom: Boolean(eventForm.create_zoom),
+      attendees: eventForm.attendees || []
+    };
+
+    const isEdit = Boolean(editingUid);
+
+    // If modifying an existing recurring event, ask whether to adjust just this event or all following
+    if (isEdit && editingIsRecurring) {
+      const rruleChanged = composedRrule !== editingOriginalRrule;
+      recurringEditScope = rruleChanged ? 'following' : 'single';
+      recurringScopeError = '';
+      pendingRecurringChange = {
+        source: 'modal',
+        uid: editingUid,
+        recurrenceId: editingRecurrenceId || startVal,
+        payload
+      };
+      showRecurringScopeModal = true;
+      return;
+    }
+
     savingEvent = true;
 
     try {
-      const isAllDay = Boolean(eventForm.all_day);
-      let startVal = localInputToIso(eventForm.start, isAllDay);
-      let endVal = localInputToIso(eventForm.end || eventForm.start, isAllDay);
-
-      if (isAllDay && startVal === endVal) {
-        const [y, m, d] = startVal.split('-').map(Number);
-        const nextDay = new Date(Date.UTC(y, m - 1, d + 1));
-        endVal = nextDay.toISOString().slice(0, 10);
-      }
-
-      if (attendeeQuery.trim()) {
-        const pending = parseTypedAttendee(attendeeQuery.trim());
-        if (pending) {
-          addAttendee(pending);
-        }
-      }
-
-      const payload = {
-        title: eventForm.title.trim(),
-        start: startVal,
-        end: endVal,
-        location: eventForm.location.trim(),
-        location_url: eventForm.location_url || '',
-        description: eventForm.description.trim(),
-        create_zoom: Boolean(eventForm.create_zoom),
-        attendees: eventForm.attendees || []
-      };
-
-      const isEdit = Boolean(editingUid);
       const url = isEdit
         ? `/api/events/${encodeURIComponent(editingUid)}`
         : '/api/events';
@@ -1244,6 +1492,9 @@
       if (res.status === 401) {
         showEventModal = false;
         editingUid = null;
+        editingIsRecurring = false;
+        editingRecurrenceId = '';
+        editingOriginalRrule = '';
         handleLogout();
         authError = 'Session expired. Please enter your passcode.';
         return;
@@ -1261,12 +1512,83 @@
 
       showEventModal = false;
       editingUid = null;
+      editingIsRecurring = false;
+      editingRecurrenceId = '';
+      editingOriginalRrule = '';
       await fetchEvents();
     } catch (err) {
       formError = 'Network error while saving event.';
     } finally {
       savingEvent = false;
     }
+  }
+
+  async function confirmRecurringChange() {
+    if (!pendingRecurringChange || applyingRecurringChange) return;
+    applyingRecurringChange = true;
+    recurringScopeError = '';
+
+    const { source, uid, recurrenceId, payload, revert } = pendingRecurringChange;
+    const scopedPayload = {
+      ...payload,
+      edit_scope: recurringEditScope,
+      recurrence_id: recurrenceId
+    };
+
+    try {
+      const res = await fetch(`/api/events/${encodeURIComponent(uid)}`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        }),
+        body: JSON.stringify(scopedPayload)
+      });
+
+      if (res.status === 401) {
+        if (source === 'drop' && revert) revert();
+        showRecurringScopeModal = false;
+        pendingRecurringChange = null;
+        showEventModal = false;
+        editingUid = null;
+        editingIsRecurring = false;
+        editingRecurrenceId = '';
+        handleLogout();
+        authError = 'Session expired. Please enter your passcode.';
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        recurringScopeError = formatApiError(data, 'Failed to update recurring event.', res.status);
+        return;
+      }
+
+      showRecurringScopeModal = false;
+      pendingRecurringChange = null;
+      if (source === 'modal') {
+        showEventModal = false;
+        editingUid = null;
+        editingIsRecurring = false;
+        editingRecurrenceId = '';
+      }
+      await fetchEvents();
+    } catch {
+      recurringScopeError = 'Network error while updating recurring event.';
+    } finally {
+      applyingRecurringChange = false;
+    }
+  }
+
+  function cancelRecurringChange() {
+    if (applyingRecurringChange) return;
+    if (pendingRecurringChange?.source === 'drop' && pendingRecurringChange.revert) {
+      pendingRecurringChange.revert();
+    }
+    showRecurringScopeModal = false;
+    pendingRecurringChange = null;
+    recurringScopeError = '';
   }
 
   async function handleEventDropOrResize(info) {
@@ -1308,12 +1630,36 @@
       title: ev.title || '(No Title)',
       start: startVal,
       end: endVal,
+      timezone: getBrowserTimeZone(),
+      rrule: ev.extendedProps?.rrule || '',
       location: ev.extendedProps?.location || '',
       location_url: sanitizeMapQuestUrl(ev.extendedProps?.locationUrl || ''),
       description: ev.extendedProps?.description || '',
       create_zoom: false,
       attendees: Array.isArray(ev.extendedProps?.attendees) ? ev.extendedProps.attendees : []
     };
+
+    if (ev.extendedProps?.isRecurring) {
+      const fallbackOldStart = info.oldEvent?.start
+        ? isAllDay
+          ? toLocalInputValue(info.oldEvent.start).slice(0, 10)
+          : info.oldEvent.start instanceof Date
+            ? info.oldEvent.start.toISOString()
+            : new Date(info.oldEvent.start).toISOString()
+        : '';
+
+      recurringEditScope = 'single';
+      recurringScopeError = '';
+      pendingRecurringChange = {
+        source: 'drop',
+        uid,
+        recurrenceId: ev.extendedProps?.recurrenceId || fallbackOldStart || startVal,
+        payload,
+        revert: () => info.revert()
+      };
+      showRecurringScopeModal = true;
+      return;
+    }
 
     bannerError = '';
 
@@ -1342,6 +1688,10 @@
         return;
       }
 
+      const updatedAttendees = Array.isArray(data.attendees)
+        ? data.attendees
+        : (payload.attendees || []).map((att) => ({ ...att, status: 'NEEDS-ACTION' }));
+
       events = events.map((item) => {
         const itemUid = item.extendedProps?.uid || item.id;
         if (itemUid === uid) {
@@ -1352,7 +1702,8 @@
             end: isAllDay ? endVal : new Date(endVal),
             extendedProps: {
               ...item.extendedProps,
-              allDay: isAllDay
+              allDay: isAllDay,
+              attendees: updatedAttendees
             }
           };
         }
@@ -1373,6 +1724,9 @@
       allDay: Boolean(ecEvent.allDay || ecEvent.extendedProps?.allDay),
       start: ecEvent.start,
       end: ecEvent.end,
+      isRecurring: Boolean(ecEvent.extendedProps?.isRecurring),
+      rrule: ecEvent.extendedProps?.rrule || '',
+      recurrenceId: ecEvent.extendedProps?.recurrenceId || '',
       location: ecEvent.extendedProps?.location || '',
       locationUrl: sanitizeMapQuestUrl(ecEvent.extendedProps?.locationUrl || ''),
       description: ecEvent.extendedProps?.description || '',
@@ -1395,6 +1749,14 @@
 
   async function handleDeleteEvent() {
     if (!selectedEvent?.uid || selectedEvent.readOnly) return;
+
+    if (selectedEvent.isRecurring) {
+      recurringDeleteScope = 'single';
+      recurringDeleteError = '';
+      showRecurringDeleteModal = true;
+      return;
+    }
+
     deletingEvent = true;
     deleteError = '';
 
@@ -1426,6 +1788,66 @@
     } finally {
       deletingEvent = false;
     }
+  }
+
+  async function confirmRecurringDelete() {
+    if (!selectedEvent?.uid || deletingRecurringScope) return;
+    deletingRecurringScope = true;
+    recurringDeleteError = '';
+
+    const recId =
+      selectedEvent.recurrenceId ||
+      (selectedEvent.allDay
+        ? toLocalInputValue(selectedEvent.start).slice(0, 10)
+        : selectedEvent.start instanceof Date
+          ? selectedEvent.start.toISOString()
+          : String(selectedEvent.start || ''));
+
+    const params = new URLSearchParams({
+      scope: recurringDeleteScope,
+      recurrence_id: recId
+    });
+
+    try {
+      const encodedUid = encodeURIComponent(selectedEvent.uid);
+      const res = await fetch(`/api/events/${encodedUid}?${params.toString()}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: authHeaders({ Accept: 'application/json' })
+      });
+
+      if (res.status === 401) {
+        showRecurringDeleteModal = false;
+        selectedEvent = null;
+        handleLogout();
+        authError = 'Session expired. Please enter your passcode.';
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        recurringDeleteError = formatApiError(
+          data,
+          'Failed to delete recurring event.',
+          res.status
+        );
+        return;
+      }
+
+      showRecurringDeleteModal = false;
+      selectedEvent = null;
+      await fetchEvents();
+    } catch {
+      recurringDeleteError = 'Network error while deleting recurring event.';
+    } finally {
+      deletingRecurringScope = false;
+    }
+  }
+
+  function cancelRecurringDelete() {
+    if (deletingRecurringScope) return;
+    showRecurringDeleteModal = false;
+    recurringDeleteError = '';
   }
 
   // --- Browser Desktop Notifications ---
@@ -2211,6 +2633,62 @@
             </label>
           </div>
 
+          <div class="field-row">
+            <label class="field">
+              <span>Repeat</span>
+              <select class="select-input" bind:value={eventForm.rrule} disabled={savingEvent}>
+                {#each RRULE_PRESETS as opt (opt.value)}
+                  <option value={opt.value}>{opt.label}</option>
+                {/each}
+                {#if eventForm.rrule && !isPresetRrule(eventForm.rrule)}
+                  <option value={eventForm.rrule}>
+                    Custom ({formatRruleSummary(eventForm.rrule)})
+                  </option>
+                {/if}
+              </select>
+            </label>
+
+            {#if eventForm.rrule}
+              <label class="field">
+                <span>Repeat Ends</span>
+                <select
+                  class="select-input"
+                  value={repeatEndType}
+                  on:change={handleRepeatEndTypeChange}
+                  disabled={savingEvent}
+                >
+                  <option value="never">Never</option>
+                  <option value="until">On date</option>
+                  <option value="count">After N occurrences</option>
+                </select>
+              </label>
+            {/if}
+          </div>
+
+          {#if eventForm.rrule && repeatEndType === 'until'}
+            <label class="field">
+              <span>End Repeat On</span>
+              <input
+                type="date"
+                bind:value={repeatUntilDate}
+                required
+                disabled={savingEvent}
+              />
+            </label>
+          {:else if eventForm.rrule && repeatEndType === 'count'}
+            <label class="field">
+              <span>Number of Occurrences</span>
+              <input
+                type="number"
+                min="1"
+                max="999"
+                bind:value={repeatCount}
+                required
+                disabled={savingEvent}
+              />
+            </label>
+          {/if}
+
           <label class="checkbox-field">
             <input
               type="checkbox"
@@ -2310,6 +2788,11 @@
                         {att.email}
                       {/if}
                     </span>
+                    <span
+                      class="attendee-chip-status status-{(att.status || 'NEEDS-ACTION').toLowerCase()}"
+                    >
+                      {formatAttendeeStatus(att.status)}
+                    </span>
                     <button
                       type="button"
                       class="attendee-chip-remove"
@@ -2322,6 +2805,11 @@
                   </span>
                 {/each}
               </div>
+              {#if editingUid}
+                <small class="field-hint attendee-pending-note">
+                  Changing event details marks invitees as Pending until they accept the update.
+                </small>
+              {/if}
             {/if}
 
             <div class="attendee-input-wrapper">
@@ -2443,6 +2931,12 @@
             <div class="detail-row">
               <strong>Ends:</strong>
               <span>{formatDateTime(selectedEvent.end, false)}</span>
+            </div>
+          {/if}
+          {#if selectedEvent.isRecurring}
+            <div class="detail-row">
+              <strong>Repeats:</strong>
+              <span>🔁 {formatRruleSummary(selectedEvent.rrule)}</span>
             </div>
           {/if}
 
@@ -2672,6 +3166,224 @@
           </button>
           <button type="button" class="btn btn-primary" on:click={closeNotificationsModal}>
             Done
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showRecurringScopeModal}
+    <div
+      class="modal-backdrop modal-backdrop-nested"
+      on:click|self={cancelRecurringChange}
+      role="presentation"
+    >
+      <div
+        class="modal modal-compact"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="recurring-scope-modal-title"
+      >
+        <div class="modal-header">
+          <div>
+            <h2 id="recurring-scope-modal-title">Change Recurring Event</h2>
+            <div class="detail-calendar-badge">
+              <span>Choose which occurrences to update</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="close-btn"
+            on:click={cancelRecurringChange}
+            disabled={applyingRecurringChange}
+            aria-label="Close"
+          >
+            &times;
+          </button>
+        </div>
+
+        {#if recurringScopeError}
+          <div class="alert alert-error">{recurringScopeError}</div>
+        {/if}
+
+        <p class="scope-prompt">
+          Would you like to apply this adjustment to just this single event, or to this event and
+          every subsequent one in the series?
+        </p>
+
+        <div class="scope-options" role="radiogroup" aria-label="Recurring event edit scope">
+          <label
+            class="scope-option"
+            class:scope-option-active={recurringEditScope === 'single'}
+          >
+            <input
+              type="radio"
+              name="recurring-edit-scope"
+              value="single"
+              bind:group={recurringEditScope}
+              disabled={applyingRecurringChange}
+            />
+            <div class="scope-option-body">
+              <span class="scope-option-title">Just this event</span>
+              <span class="scope-option-desc">
+                Only adjusts this single occurrence; all other events in the series remain unchanged.
+              </span>
+            </div>
+          </label>
+
+          <label
+            class="scope-option"
+            class:scope-option-active={recurringEditScope === 'following'}
+          >
+            <input
+              type="radio"
+              name="recurring-edit-scope"
+              value="following"
+              bind:group={recurringEditScope}
+              disabled={applyingRecurringChange}
+            />
+            <div class="scope-option-body">
+              <span class="scope-option-title">This and following events</span>
+              <span class="scope-option-desc">
+                Updates this event and every subsequent occurrence in the series.
+              </span>
+            </div>
+          </label>
+        </div>
+
+        <div class="modal-actions">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={cancelRecurringChange}
+            disabled={applyingRecurringChange}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="btn btn-primary"
+            on:click={confirmRecurringChange}
+            disabled={applyingRecurringChange}
+          >
+            {applyingRecurringChange ? 'Applying...' : 'Apply Change'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showRecurringDeleteModal}
+    <div
+      class="modal-backdrop modal-backdrop-nested"
+      on:click|self={cancelRecurringDelete}
+      role="presentation"
+    >
+      <div
+        class="modal modal-compact"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="recurring-delete-modal-title"
+      >
+        <div class="modal-header">
+          <div>
+            <h2 id="recurring-delete-modal-title">Delete Recurring Event</h2>
+            <div class="detail-calendar-badge">
+              <span>Choose which occurrences to remove</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="close-btn"
+            on:click={cancelRecurringDelete}
+            disabled={deletingRecurringScope}
+            aria-label="Close"
+          >
+            &times;
+          </button>
+        </div>
+
+        {#if recurringDeleteError}
+          <div class="alert alert-error">{recurringDeleteError}</div>
+        {/if}
+
+        <div class="scope-options" role="radiogroup" aria-label="Recurring event delete scope">
+          <label
+            class="scope-option"
+            class:scope-option-active={recurringDeleteScope === 'single'}
+          >
+            <input
+              type="radio"
+              name="recurring-delete-scope"
+              value="single"
+              bind:group={recurringDeleteScope}
+              disabled={deletingRecurringScope}
+            />
+            <div class="scope-option-body">
+              <span class="scope-option-title">Just this event</span>
+              <span class="scope-option-desc">
+                Deletes only this single occurrence and keeps the rest of the series.
+              </span>
+            </div>
+          </label>
+
+          <label
+            class="scope-option"
+            class:scope-option-active={recurringDeleteScope === 'following'}
+          >
+            <input
+              type="radio"
+              name="recurring-delete-scope"
+              value="following"
+              bind:group={recurringDeleteScope}
+              disabled={deletingRecurringScope}
+            />
+            <div class="scope-option-body">
+              <span class="scope-option-title">This and following events</span>
+              <span class="scope-option-desc">
+                Deletes this event and all future occurrences while keeping earlier ones.
+              </span>
+            </div>
+          </label>
+
+          <label
+            class="scope-option"
+            class:scope-option-active={recurringDeleteScope === 'all'}
+          >
+            <input
+              type="radio"
+              name="recurring-delete-scope"
+              value="all"
+              bind:group={recurringDeleteScope}
+              disabled={deletingRecurringScope}
+            />
+            <div class="scope-option-body">
+              <span class="scope-option-title">All events in the series</span>
+              <span class="scope-option-desc">
+                Deletes the entire recurring series{selectedEvent?.attendees?.length
+                  ? ' and notifies invitees'
+                  : ''}.
+              </span>
+            </div>
+          </label>
+        </div>
+
+        <div class="modal-actions">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={cancelRecurringDelete}
+            disabled={deletingRecurringScope}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="btn btn-danger"
+            on:click={confirmRecurringDelete}
+            disabled={deletingRecurringScope}
+          >
+            {deletingRecurringScope ? 'Deleting...' : 'Delete'}
           </button>
         </div>
       </div>
@@ -3027,6 +3739,72 @@
 
   .modal-wide {
     max-width: 600px;
+  }
+
+  .modal-backdrop-nested {
+    z-index: 1100;
+  }
+
+  .modal-compact {
+    max-width: 440px;
+  }
+
+  .scope-prompt {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+  }
+
+  .scope-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .scope-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.7rem;
+    padding: 0.75rem 0.85rem;
+    border-radius: 0.55rem;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-page);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+
+  .scope-option:hover {
+    border-color: var(--border-color);
+  }
+
+  .scope-option-active {
+    border-color: #3b82f6;
+    background: rgba(59, 130, 246, 0.08);
+  }
+
+  .scope-option input[type='radio'] {
+    margin-top: 0.2rem;
+    accent-color: #3b82f6;
+    cursor: pointer;
+  }
+
+  .scope-option-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .scope-option-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .scope-option-desc {
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--text-muted);
   }
 
   .modal-header {
@@ -3559,6 +4337,24 @@
   .status-tentative {
     background: rgba(245, 158, 11, 0.16);
     color: #f59e0b;
+  }
+
+  .status-needs-action {
+    background: rgba(59, 130, 246, 0.14);
+    color: #3b82f6;
+  }
+
+  .attendee-chip-status {
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 0.08rem 0.4rem;
+    border-radius: 999px;
+  }
+
+  .attendee-pending-note {
+    margin-left: 0;
+    margin-bottom: 0.15rem;
+    display: block;
   }
 
   .version-corner {

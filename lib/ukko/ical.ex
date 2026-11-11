@@ -75,13 +75,23 @@ defmodule Ukko.ICal do
       ) do
     {range_start_dt, range_end_dt} = parse_filter_range(range_start_iso, range_end_iso)
 
+    master_rrules =
+      Enum.reduce(raw_vevents, %{}, fn ev, acc ->
+        if map_size(ev.rrule) > 0 and is_nil(ev.recurrence_id) do
+          Map.put(acc, ev.uid, Map.get(ev, :rrule_raw, ""))
+        else
+          acc
+        end
+      end)
+
     raw_vevents
     |> Enum.flat_map(fn ev ->
       if map_size(ev.rrule) == 0 and not single_event_in_rough_range?(ev.dtstart, ev.dtend, range_start_dt, range_end_dt) do
         []
       else
         override_keys = Map.get(recurrence_overrides, ev.uid, MapSet.new())
-        expand_vevent(ev, vtimezones, range_start_dt, range_end_dt, override_keys, extra_meta)
+        ev_meta = Map.put(extra_meta, :series_rrule, Map.get(master_rrules, ev.uid))
+        expand_vevent(ev, vtimezones, range_start_dt, range_end_dt, override_keys, ev_meta)
       end
     end)
     |> filter_by_range(range_start_dt, range_end_dt)
@@ -303,6 +313,7 @@ defmodule Ukko.ICal do
           dtend: dtend_info,
           duration_sec: duration_sec,
           rrule: parse_rrule_map(rrule_str),
+          rrule_raw: String.trim(rrule_str || ""),
           recurrence_id: recurrence_id,
           exdates: exdates,
           organizer: organizer,
@@ -445,9 +456,14 @@ defmodule Ukko.ICal do
   end
 
   defp recurrence_match_key({:date, %Date{} = d}), do: {:date, Date.to_iso8601(d)}
-  defp recurrence_match_key({:utc, %DateTime{} = dt, _ndt, _tz}), do: {:date, Date.to_iso8601(DateTime.to_date(dt))}
-  defp recurrence_match_key({:local, _dt, %NaiveDateTime{} = ndt, _tz}), do: {:date, Date.to_iso8601(NaiveDateTime.to_date(ndt))}
+  defp recurrence_match_key({:utc, %DateTime{} = dt, _ndt, _tz}), do: {:utc_unix, DateTime.to_unix(dt)}
+  defp recurrence_match_key({:local, %DateTime{} = dt, _ndt, _tz}), do: {:utc_unix, DateTime.to_unix(dt)}
   defp recurrence_match_key(_), do: :none
+
+  defp dt_info_to_iso({:date, %Date{} = d}), do: Date.to_iso8601(d)
+  defp dt_info_to_iso({:utc, %DateTime{} = dt, _ndt, _tz}), do: format_utc_iso(dt)
+  defp dt_info_to_iso({:local, %DateTime{} = dt, _ndt, _tz}), do: format_utc_iso(dt)
+  defp dt_info_to_iso(_), do: nil
 
   defp extract_tzid(params) when is_list(params) do
     Enum.find_value(params, fn param ->
@@ -788,20 +804,26 @@ defmodule Ukko.ICal do
       end
 
     start_date = extract_local_date(ev.dtstart)
+    until_utc = parse_until_utc(Map.get(ev.rrule, "UNTIL"))
     occurrence_dates = generate_rrule_dates(ev.rrule, start_date, win_start_date, win_end_date, excluded)
 
-    Enum.map(occurrence_dates, fn occ_date ->
+    occurrence_dates
+    |> Enum.map(fn occ_date ->
       case ev.dtstart do
         {:date, %Date{} = orig_s} ->
-          day_span =
-            case ev.dtend do
-              {:date, %Date{} = orig_e} -> max(Date.diff(orig_e, orig_s), 1)
-              _ -> 1
-            end
+          if not is_nil(until_utc) and Date.compare(occ_date, DateTime.to_date(until_utc)) == :gt do
+            nil
+          else
+            day_span =
+              case ev.dtend do
+                {:date, %Date{} = orig_e} -> max(Date.diff(orig_e, orig_s), 1)
+                _ -> 1
+              end
 
-          s_iso = Date.to_iso8601(occ_date)
-          e_iso = Date.to_iso8601(Date.add(occ_date, day_span))
-          decorate_event_map(ev, s_iso, e_iso, true, extra_meta)
+            s_iso = Date.to_iso8601(occ_date)
+            e_iso = Date.to_iso8601(Date.add(occ_date, day_span))
+            decorate_event_map(ev, s_iso, e_iso, true, extra_meta)
+          end
 
         {kind, %DateTime{} = orig_s_utc, %NaiveDateTime{} = orig_s_ndt, tzid} ->
           duration_sec =
@@ -822,17 +844,38 @@ defmodule Ukko.ICal do
               local_ndt_to_utc(occ_ndt, tzid, vtimezones)
             end
 
-          occ_e_utc = DateTime.add(occ_s_utc, duration_sec, :second)
-          decorate_event_map(ev, format_utc_iso(occ_s_utc), format_utc_iso(occ_e_utc), false, extra_meta)
+          cond do
+            MapSet.member?(excluded, {:utc_unix, DateTime.to_unix(occ_s_utc)}) ->
+              nil
+
+            not is_nil(until_utc) and DateTime.compare(occ_s_utc, until_utc) == :gt ->
+              nil
+
+            true ->
+              occ_e_utc = DateTime.add(occ_s_utc, duration_sec, :second)
+              decorate_event_map(ev, format_utc_iso(occ_s_utc), format_utc_iso(occ_e_utc), false, extra_meta)
+          end
       end
     end)
+    |> Enum.reject(&is_nil/1)
   end
 
   defp generate_rrule_dates(rrule, %Date{} = start_date, win_start, win_end, excluded) do
     freq = String.upcase(Map.get(rrule, "FREQ", ""))
     interval = max(parse_int(Map.get(rrule, "INTERVAL"), 1), 1)
     max_count = parse_int(Map.get(rrule, "COUNT"), nil)
-    until_date = parse_until_date(Map.get(rrule, "UNTIL"))
+    raw_until = Map.get(rrule, "UNTIL")
+    until_utc = parse_until_utc(raw_until)
+
+    until_date =
+      cond do
+        not is_nil(until_utc) ->
+          # Add 1-day cushion for date generation; exact UTC cutoff is enforced per occurrence
+          Date.add(DateTime.to_date(until_utc), 1)
+
+        true ->
+          parse_until_date(raw_until)
+      end
 
     eff_end =
       if until_date && Date.compare(until_date, win_end) == :lt do
@@ -995,6 +1038,20 @@ defmodule Ukko.ICal do
     read_only = Map.get(extra_meta, :read_only, false)
 
     id_prefix = if sub_id, do: "#{sub_id}::#{ev.uid}", else: ev.uid
+    series_rrule = Map.get(extra_meta, :series_rrule)
+    ev_rrule_raw = Map.get(ev, :rrule_raw, "")
+    effective_rrule = if ev_rrule_raw != "", do: ev_rrule_raw, else: series_rrule || ""
+
+    is_recurring =
+      map_size(ev.rrule) > 0 or not is_nil(ev.recurrence_id) or
+        (is_binary(series_rrule) and series_rrule != "")
+
+    rec_id_str =
+      cond do
+        not is_nil(ev.recurrence_id) -> dt_info_to_iso(ev.recurrence_id)
+        is_recurring -> start_str
+        true -> nil
+      end
 
     base = %{
       id: "#{id_prefix}::#{start_str}",
@@ -1008,6 +1065,9 @@ defmodule Ukko.ICal do
       locationUrl: Map.get(ev, :location_url),
       organizer: Map.get(ev, :organizer),
       attendees: Map.get(ev, :attendees, []),
+      isRecurring: is_recurring,
+      rrule: effective_rrule,
+      recurrenceId: rec_id_str,
       readOnly: read_only,
       calendarName: calendar_name,
       subscriptionId: sub_id,
@@ -1018,6 +1078,9 @@ defmodule Ukko.ICal do
         locationUrl: Map.get(ev, :location_url),
         organizer: Map.get(ev, :organizer),
         attendees: Map.get(ev, :attendees, []),
+        isRecurring: is_recurring,
+        rrule: effective_rrule,
+        recurrenceId: rec_id_str,
         readOnly: read_only,
         calendarName: calendar_name,
         subscriptionId: sub_id,
@@ -1095,6 +1158,10 @@ defmodule Ukko.ICal do
         {:ok, ndt} = NaiveDateTime.from_iso8601(trimmed)
         DateTime.from_naive!(ndt, "Etc/UTC")
 
+      match?({:ok, _}, NaiveDateTime.from_iso8601(trimmed <> ":00")) ->
+        {:ok, ndt} = NaiveDateTime.from_iso8601(trimmed <> ":00")
+        DateTime.from_naive!(ndt, "Etc/UTC")
+
       match?({:ok, _}, Date.from_iso8601(trimmed)) ->
         {:ok, d} = Date.from_iso8601(trimmed)
         DateTime.new!(d, ~T[00:00:00], "Etc/UTC")
@@ -1147,12 +1214,37 @@ defmodule Ukko.ICal do
   defp weekday_number("SU"), do: 7
   defp weekday_number(_), do: nil
 
+  defp weekday_code(1), do: "MO"
+  defp weekday_code(2), do: "TU"
+  defp weekday_code(3), do: "WE"
+  defp weekday_code(4), do: "TH"
+  defp weekday_code(5), do: "FR"
+  defp weekday_code(6), do: "SA"
+  defp weekday_code(7), do: "SU"
+
   defp parse_until_date(nil), do: nil
 
   defp parse_until_date(str) when is_binary(str) do
     case parse_date_ical(String.slice(String.trim(str), 0, 8)) do
       {:ok, d} -> d
       _ -> nil
+    end
+  end
+
+  defp parse_until_utc(nil), do: nil
+
+  defp parse_until_utc(str) when is_binary(str) do
+    trimmed = String.trim(str)
+
+    if String.contains?(trimmed, "T") do
+      clean = String.trim_trailing(trimmed, "Z")
+
+      case parse_naive_ical(clean) do
+        {:ok, ndt} -> DateTime.from_naive!(ndt, "Etc/UTC")
+        _ -> nil
+      end
+    else
+      nil
     end
   end
 
@@ -1315,23 +1407,76 @@ defmodule Ukko.ICal do
   end
 
   @doc """
-  Builds an RFC 5545 `.ics` VCALENDAR string for a single event.
-  Supports optional `:attendees` (list of `%{name, email, status}` maps or email strings)
-  and `:organizer_email`.
+  Builds an RFC 5545 `.ics` VCALENDAR string for a single event (or recurring master event).
+  Supports optional `:rrule`, `:timezone`, `:recurrence_id_line`, `:sequence`, `:attendees`,
+  `:organizer_email`, and `:organizer_name`.
   """
-  def build_ics(%{uid: uid, title: title, start: start_iso, end: end_iso} = attrs) do
+  def build_ics(%{uid: _uid, title: _title, start: start_iso, end: _end_iso} = attrs) do
+    tz_tuple =
+      if all_day_iso?(start_iso) do
+        nil
+      else
+        supported_vtimezone(Map.get(attrs, :timezone))
+      end
+
+    effective_attrs =
+      case tz_tuple do
+        {canonical_tzid, _vt_block} -> Map.put(attrs, :timezone, canonical_tzid)
+        nil -> Map.delete(attrs, :timezone)
+      end
+
+    vevent = build_vevent_component(effective_attrs)
+
+    vt_blocks =
+      case tz_tuple do
+        {_canonical_tzid, vt_block} -> [vt_block]
+        nil -> []
+      end
+
+    wrap_vcalendar(vt_blocks, [vevent])
+  end
+
+  @doc """
+  Builds a single `BEGIN:VEVENT ... END:VEVENT` component string from `attrs`.
+  """
+  def build_vevent_component(%{uid: uid, title: title, start: start_iso, end: end_iso} = attrs) do
     description = Map.get(attrs, :description) || ""
     location = Map.get(attrs, :location) || ""
     location_url = Map.get(attrs, :location_url)
+    rrule = sanitize_rrule(Map.get(attrs, :rrule))
+    rec_id_line = Map.get(attrs, :recurrence_id_line)
+    raw_seq = Map.get(attrs, :sequence)
+    sequence = if is_integer(raw_seq) and raw_seq >= 0, do: raw_seq, else: 0
+    tzid = non_empty_trimmed(Map.get(attrs, :timezone))
+    vtimezones = Map.get(attrs, :vtimezones) || %{}
     attendees = normalize_attendees(Map.get(attrs, :attendees) || [])
+
     organizer_email =
       Map.get(attrs, :organizer_email) ||
         Application.get_env(:ukko, :thundermail_user) ||
         ""
 
+    organizer_name = Map.get(attrs, :organizer_name) || ""
+
     dtstamp = iso8601_to_ical_utc(DateTime.utc_now())
-    dtstart = format_dt_prop("DTSTART", start_iso)
-    dtend = format_dt_prop("DTEND", end_iso || start_iso)
+    dtstart = format_dt_prop("DTSTART", start_iso, tzid, vtimezones)
+    dtend = format_dt_prop("DTEND", end_iso || start_iso, tzid, vtimezones)
+
+    rec_id_lines =
+      if is_binary(rec_id_line) and String.trim(rec_id_line) != "" do
+        [String.trim(rec_id_line)]
+      else
+        []
+      end
+
+    rrule_lines =
+      if is_binary(rrule) and rrule != "" and rec_id_lines == [] do
+        ["RRULE:#{rrule}"]
+      else
+        []
+      end
+
+    sequence_lines = ["SEQUENCE:#{sequence}"]
 
     clean_loc_url = sanitize_location_url(location_url)
 
@@ -1342,33 +1487,1153 @@ defmodule Ukko.ICal do
         []
       end
 
-    participant_lines = build_participant_lines(organizer_email, attendees)
+    participant_lines = build_participant_lines(organizer_email, organizer_name, attendees)
 
+    lines =
+      [
+        "BEGIN:VEVENT",
+        "UID:#{uid}",
+        "DTSTAMP:#{dtstamp}"
+      ] ++
+        rec_id_lines ++
+        sequence_lines ++
+        [
+          dtstart,
+          dtend
+        ] ++
+        rrule_lines ++
+        [
+          "SUMMARY:#{escape_text(title || "Untitled Event")}",
+          "DESCRIPTION:#{escape_text(description)}",
+          "LOCATION:#{escape_text(location)}"
+        ] ++
+        location_url_lines ++
+        participant_lines ++
+        [
+          "END:VEVENT"
+        ]
+
+    Enum.join(lines, "\r\n")
+  end
+
+  @doc """
+  Resets all non-organizer invitees' participation statuses to `"NEEDS-ACTION"` (Pending)
+  so invitees show as pending until they accept updated event details.
+  """
+  def reset_attendees_to_pending(attendees, organizer_email \\ nil) when is_list(attendees) do
+    org_down =
+      organizer_email
+      |> to_string()
+      |> String.trim()
+      |> String.replace(~r/^mailto:/i, "")
+      |> String.downcase()
+
+    attendees
+    |> normalize_attendees()
+    |> Enum.map(fn att ->
+      if org_down != "" and String.downcase(att.email) == org_down do
+        %{att | status: "ACCEPTED"}
+      else
+        %{att | status: "NEEDS-ACTION"}
+      end
+    end)
+  end
+
+  @doc """
+  Builds an updated `.ics` payload for an existing non-recurring event, incrementing
+  `SEQUENCE` and resetting invitees to `"NEEDS-ACTION"` (Pending) whenever event details change.
+  Returns `{updated_ics, final_attendees}`.
+  """
+  def prepare_single_event_update(raw_ics, new_attrs)
+      when is_binary(raw_ics) and is_map(new_attrs) do
+    unfolded = unfold(raw_ics)
+    vtimezones = parse_vtimezones(unfolded)
+
+    existing_vt_blocks =
+      unfolded
+      |> extract_component_blocks("VTIMEZONE")
+      |> Enum.map(fn inner -> "BEGIN:VTIMEZONE\r\n" <> String.trim(inner) <> "\r\nEND:VTIMEZONE" end)
+
+    vevent_inners =
+      unfolded
+      |> extract_component_blocks("VEVENT")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    case vevent_inners do
+      [first_inner | _] ->
+        existing_ev = parse_raw_vevent(first_inner, vtimezones)
+        {existing_props, _, _, _} = extract_vevent_all_props(first_inner)
+        next_seq = (parse_int(get_prop_raw(existing_props, "SEQUENCE"), 0) || 0) + 1
+
+        {org_email, org_name} = resolve_organizer_meta(existing_ev, new_attrs)
+
+        final_attendees =
+          if single_event_details_changed?(existing_ev, new_attrs) do
+            reset_attendees_to_pending(Map.get(new_attrs, :attendees) || [], org_email)
+          else
+            normalize_attendees(Map.get(new_attrs, :attendees) || [])
+          end
+
+        existing_tzid = if existing_ev, do: extract_dtstart_tzid(existing_ev.dtstart), else: nil
+        effective_tzid = choose_effective_tzid(Map.get(new_attrs, :timezone), existing_tzid, new_attrs.start)
+        vt_blocks = ensure_vtimezone_blocks(existing_vt_blocks, effective_tzid)
+
+        vevent =
+          build_vevent_component(
+            new_attrs
+            |> Map.put(:sequence, next_seq)
+            |> Map.put(:attendees, final_attendees)
+            |> Map.put(:organizer_email, org_email)
+            |> Map.put(:organizer_name, org_name)
+            |> Map.put(:timezone, effective_tzid)
+            |> Map.put(:vtimezones, vtimezones)
+          )
+
+        {wrap_vcalendar(vt_blocks, [vevent]), final_attendees}
+
+      [] ->
+        final_attendees =
+          reset_attendees_to_pending(
+            Map.get(new_attrs, :attendees) || [],
+            Map.get(new_attrs, :organizer_email) || Application.get_env(:ukko, :thundermail_user)
+          )
+
+        attrs_with_pending = Map.put(new_attrs, :attendees, final_attendees)
+        {build_ics(attrs_with_pending), final_attendees}
+    end
+  end
+
+  @doc """
+  Applies a recurring event modification (`"single"` or `"following"`) to an existing
+  CalDAV `.ics` payload:
+  - `"single"`: Adds/replaces a `RECURRENCE-ID` override `VEVENT` inside the existing `.ics`
+    while leaving the master `RRULE` and other occurrences untouched.
+    Returns `{:single_put, updated_ics, final_attendees}`.
+  - `"following"`:
+    - If editing from the very first occurrence of the series, updates the master series in-place
+      and returns `{:single_put, updated_ics, final_attendees}`.
+    - Otherwise, truncates the original master `RRULE` with `UNTIL` right before the edited
+      occurrence, drops subsequent overrides from the original `.ics`, and creates a new
+      recurring series `.ics` starting at the edited occurrence.
+      Returns `{:split_put, truncated_master_ics, new_uid, new_series_ics, final_attendees}`.
+  """
+  def apply_recurring_edit(raw_ics, scope, recurrence_id_iso, new_attrs)
+      when is_binary(raw_ics) and scope in ["single", "following"] and is_map(new_attrs) do
+    unfolded = unfold(raw_ics)
+    vtimezones = parse_vtimezones(unfolded)
+
+    vtimezone_blocks =
+      unfolded
+      |> extract_component_blocks("VTIMEZONE")
+      |> Enum.map(fn inner -> "BEGIN:VTIMEZONE\r\n" <> String.trim(inner) <> "\r\nEND:VTIMEZONE" end)
+
+    vevent_inners =
+      unfolded
+      |> extract_component_blocks("VEVENT")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    {master_inner, other_inners} = split_master_and_overrides(vevent_inners)
+
+    case master_inner do
+      nil ->
+        {updated_ics, final_attendees} = prepare_single_event_update(raw_ics, new_attrs)
+        {:single_put, updated_ics, final_attendees}
+
+      master_block ->
+        master_ev = parse_raw_vevent(master_block, vtimezones)
+        {master_props, _, _, _} = extract_vevent_all_props(master_block)
+
+        if is_nil(master_ev) or map_size(master_ev.rrule) == 0 do
+          {updated_ics, final_attendees} = prepare_single_event_update(raw_ics, new_attrs)
+          {:single_put, updated_ics, final_attendees}
+        else
+          target_rec_iso = non_empty_trimmed(recurrence_id_iso) || new_attrs.start
+          master_seq = parse_int(get_prop_raw(master_props, "SEQUENCE"), 0) || 0
+
+          matching_override_inner =
+            Enum.find(other_inners, fn inner ->
+              override_matches_target?(inner, target_rec_iso, vtimezones)
+            end)
+
+          matching_override_ev =
+            if matching_override_inner,
+              do: parse_raw_vevent(matching_override_inner, vtimezones),
+              else: nil
+
+          override_seq =
+            if matching_override_inner do
+              {ov_props, _} = extract_block_props(matching_override_inner)
+              parse_int(get_prop_raw(ov_props, "SEQUENCE"), master_seq) || master_seq
+            else
+              master_seq
+            end
+
+          next_seq = max(master_seq, override_seq) + 1
+          {org_email, org_name} = resolve_organizer_meta(matching_override_ev || master_ev, new_attrs)
+
+          final_attendees =
+            if recurring_occurrence_changed?(
+                 master_ev,
+                 matching_override_ev,
+                 scope,
+                 target_rec_iso,
+                 new_attrs
+               ) do
+              reset_attendees_to_pending(Map.get(new_attrs, :attendees) || [], org_email)
+            else
+              normalize_attendees(Map.get(new_attrs, :attendees) || [])
+            end
+
+          master_tzid = extract_dtstart_tzid(master_ev.dtstart)
+
+          case scope do
+            "single" ->
+              # Keep the override's TZID aligned with the master series when timed
+              single_tzid =
+                if all_day_iso?(new_attrs.start) do
+                  nil
+                else
+                  master_tzid || choose_effective_tzid(Map.get(new_attrs, :timezone), nil, new_attrs.start)
+                end
+
+              vt_blocks = ensure_vtimezone_blocks(vtimezone_blocks, single_tzid)
+
+              rec_id_line =
+                build_recurrence_id_line(
+                  Map.get(master_props, "DTSTART"),
+                  target_rec_iso,
+                  vtimezones
+                )
+
+              override_vevent =
+                build_vevent_component(
+                  new_attrs
+                  |> Map.put(:uid, master_ev.uid)
+                  |> Map.put(:rrule, nil)
+                  |> Map.put(:recurrence_id_line, rec_id_line)
+                  |> Map.put(:sequence, next_seq)
+                  |> Map.put(:attendees, final_attendees)
+                  |> Map.put(:organizer_email, org_email)
+                  |> Map.put(:organizer_name, org_name)
+                  |> Map.put(:timezone, single_tzid)
+                  |> Map.put(:vtimezones, vtimezones)
+                )
+
+              kept_overrides =
+                other_inners
+                |> Enum.reject(fn inner ->
+                  override_matches_target?(inner, target_rec_iso, vtimezones)
+                end)
+                |> Enum.map(&("BEGIN:VEVENT\r\n" <> &1 <> "\r\nEND:VEVENT"))
+
+              master_wrapped = "BEGIN:VEVENT\r\n" <> master_block <> "\r\nEND:VEVENT"
+              updated_ics = wrap_vcalendar(vt_blocks, [master_wrapped | kept_overrides] ++ [override_vevent])
+              {:single_put, updated_ics, final_attendees}
+
+            "following" ->
+              is_first = first_occurrence?(master_ev.dtstart, target_rec_iso)
+
+              following_tzid =
+                choose_effective_tzid(Map.get(new_attrs, :timezone), master_tzid, new_attrs.start)
+
+              adjusted_rrule =
+                adjust_rrule_for_following(
+                  master_ev,
+                  target_rec_iso,
+                  new_attrs,
+                  is_first,
+                  following_tzid,
+                  vtimezones
+                )
+
+              vt_blocks_following = ensure_vtimezone_blocks(vtimezone_blocks, following_tzid)
+
+              if is_first do
+                updated_master =
+                  build_vevent_component(
+                    new_attrs
+                    |> Map.put(:uid, master_ev.uid)
+                    |> Map.put(:rrule, adjusted_rrule)
+                    |> Map.put(:sequence, master_seq + 1)
+                    |> Map.put(:attendees, final_attendees)
+                    |> Map.put(:organizer_email, org_email)
+                    |> Map.put(:organizer_name, org_name)
+                    |> Map.put(:timezone, following_tzid)
+                    |> Map.put(:vtimezones, vtimezones)
+                  )
+
+                {:single_put, wrap_vcalendar(vt_blocks_following, [updated_master]), final_attendees}
+              else
+                until_val = compute_until_before(master_ev.dtstart, target_rec_iso)
+                truncated_master_inner = replace_master_rrule_until(master_block, master_ev.rrule_raw, until_val)
+
+                kept_prior_overrides =
+                  other_inners
+                  |> Enum.filter(fn inner ->
+                    override_before_target?(inner, target_rec_iso, vtimezones)
+                  end)
+                  |> Enum.map(&("BEGIN:VEVENT\r\n" <> &1 <> "\r\nEND:VEVENT"))
+
+                truncated_master_ics =
+                  wrap_vcalendar(
+                    vtimezone_blocks,
+                    ["BEGIN:VEVENT\r\n" <> truncated_master_inner <> "\r\nEND:VEVENT" | kept_prior_overrides]
+                  )
+
+                new_uid = generate_uid()
+
+                new_master_vevent =
+                  build_vevent_component(
+                    new_attrs
+                    |> Map.put(:uid, new_uid)
+                    |> Map.put(:rrule, adjusted_rrule)
+                    |> Map.put(:sequence, 0)
+                    |> Map.put(:attendees, final_attendees)
+                    |> Map.put(:organizer_email, org_email)
+                    |> Map.put(:organizer_name, org_name)
+                    |> Map.put(:timezone, following_tzid)
+                    |> Map.put(:vtimezones, vtimezones)
+                  )
+
+                new_vt_blocks = ensure_vtimezone_blocks([], following_tzid)
+                new_series_ics = wrap_vcalendar(new_vt_blocks, [new_master_vevent])
+
+                {:split_put, truncated_master_ics, new_uid, new_series_ics, final_attendees}
+              end
+          end
+        end
+    end
+  end
+
+  @doc """
+  Applies a recurring event deletion (`"single"`, `"following"`, or `"all"`):
+  - `"single"`: Adds an `EXDATE` for `recurrence_id_iso` to the master `VEVENT` and drops any
+    matching `RECURRENCE-ID` override, returning `{:single_put, updated_ics}`.
+  - `"following"`: Returns `:delete_all` if deleting from the first occurrence; otherwise
+    truncates the master `RRULE` with `UNTIL` right before `recurrence_id_iso`, returning
+    `{:single_put, truncated_master_ics}`.
+  - `"all"`: Returns `:delete_all`.
+  """
+  def apply_recurring_delete(_raw_ics, "all", _recurrence_id_iso), do: :delete_all
+
+  def apply_recurring_delete(raw_ics, scope, recurrence_id_iso)
+      when is_binary(raw_ics) and scope in ["single", "following"] do
+    unfolded = unfold(raw_ics)
+    vtimezones = parse_vtimezones(unfolded)
+
+    vtimezone_blocks =
+      unfolded
+      |> extract_component_blocks("VTIMEZONE")
+      |> Enum.map(fn inner -> "BEGIN:VTIMEZONE\r\n" <> String.trim(inner) <> "\r\nEND:VTIMEZONE" end)
+
+    vevent_inners =
+      unfolded
+      |> extract_component_blocks("VEVENT")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    {master_inner, other_inners} = split_master_and_overrides(vevent_inners)
+
+    case master_inner do
+      nil ->
+        :delete_all
+
+      master_block ->
+        master_ev = parse_raw_vevent(master_block, vtimezones)
+        {master_props, _, _, _} = extract_vevent_all_props(master_block)
+        target_rec_iso = non_empty_trimmed(recurrence_id_iso)
+
+        cond do
+          is_nil(master_ev) or map_size(master_ev.rrule) == 0 or is_nil(target_rec_iso) ->
+            :delete_all
+
+          scope == "single" ->
+            exdate_line =
+              build_exdate_line(Map.get(master_props, "DTSTART"), target_rec_iso, vtimezones)
+
+            master_with_exdate = master_block <> "\r\n" <> exdate_line
+
+            kept_overrides =
+              other_inners
+              |> Enum.reject(fn inner ->
+                override_matches_target?(inner, target_rec_iso, vtimezones)
+              end)
+              |> Enum.map(&("BEGIN:VEVENT\r\n" <> &1 <> "\r\nEND:VEVENT"))
+
+            updated_ics =
+              wrap_vcalendar(
+                vtimezone_blocks,
+                ["BEGIN:VEVENT\r\n" <> master_with_exdate <> "\r\nEND:VEVENT" | kept_overrides]
+              )
+
+            {:single_put, updated_ics}
+
+          scope == "following" ->
+            if first_occurrence?(master_ev.dtstart, target_rec_iso) do
+              :delete_all
+            else
+              until_val = compute_until_before(master_ev.dtstart, target_rec_iso)
+              truncated_master_inner = replace_master_rrule_until(master_block, master_ev.rrule_raw, until_val)
+
+              kept_prior_overrides =
+                other_inners
+                |> Enum.filter(fn inner ->
+                  override_before_target?(inner, target_rec_iso, vtimezones)
+                end)
+                |> Enum.map(&("BEGIN:VEVENT\r\n" <> &1 <> "\r\nEND:VEVENT"))
+
+              truncated_master_ics =
+                wrap_vcalendar(
+                  vtimezone_blocks,
+                  ["BEGIN:VEVENT\r\n" <> truncated_master_inner <> "\r\nEND:VEVENT" | kept_prior_overrides]
+                )
+
+              {:single_put, truncated_master_ics}
+            end
+        end
+    end
+  end
+
+  defp wrap_vcalendar(vtimezone_blocks, vevent_blocks) do
     lines =
       [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//Ukko//CalDAV Client//EN",
-        "CALSCALE:GREGORIAN",
-        "BEGIN:VEVENT",
-        "UID:#{uid}",
-        "DTSTAMP:#{dtstamp}",
-        dtstart,
-        dtend,
-        "SUMMARY:#{escape_text(title || "Untitled Event")}",
-        "DESCRIPTION:#{escape_text(description)}",
-        "LOCATION:#{escape_text(location)}"
-      ] ++
-        location_url_lines ++
-        participant_lines ++
-        [
-          "END:VEVENT",
-          "END:VCALENDAR",
-          ""
-        ]
+        "CALSCALE:GREGORIAN"
+      ] ++ vtimezone_blocks ++ vevent_blocks ++ ["END:VCALENDAR", ""]
 
     Enum.join(lines, "\r\n")
   end
+
+  defp split_master_and_overrides(vevent_inners) do
+    Enum.reduce(vevent_inners, {nil, []}, fn inner, {master_acc, others_acc} ->
+      {props, _} = extract_block_props(inner)
+      has_rrule = not is_nil(Map.get(props, "RRULE"))
+      has_rec_id = not is_nil(Map.get(props, "RECURRENCE-ID"))
+
+      if is_nil(master_acc) and has_rrule and not has_rec_id do
+        {inner, others_acc}
+      else
+        {master_acc, others_acc ++ [inner]}
+      end
+    end)
+  end
+
+  defp build_recurrence_id_line(master_dtstart_prop, target_rec_iso, vtimezones) do
+    build_matching_dt_line("RECURRENCE-ID", master_dtstart_prop, target_rec_iso, vtimezones)
+  end
+
+  defp build_exdate_line(master_dtstart_prop, target_rec_iso, vtimezones) do
+    build_matching_dt_line("EXDATE", master_dtstart_prop, target_rec_iso, vtimezones)
+  end
+
+  defp build_matching_dt_line(prop_name, master_dtstart_prop, target_rec_iso, vtimezones) do
+    case master_dtstart_prop do
+      {params, raw_val} ->
+        val = String.trim(raw_val)
+        tzid = extract_tzid(params)
+        has_date_param = Enum.any?(params, fn p -> String.upcase(String.trim(p)) == "VALUE=DATE" end)
+
+        cond do
+          has_date_param or match?(<<_::binary-size(8)>>, val) ->
+            date = iso_to_date(target_rec_iso) || Date.utc_today()
+            "#{prop_name};VALUE=DATE:#{Calendar.strftime(date, "%Y%m%d")}"
+
+          String.ends_with?(val, "Z") ->
+            "#{prop_name}:#{iso8601_to_ical_utc(target_rec_iso)}"
+
+          not is_nil(tzid) and tzid != "" ->
+            utc_dt = parse_iso_dt(target_rec_iso) || DateTime.utc_now()
+            local_ndt = utc_to_local_ndt(utc_dt, tzid, vtimezones)
+            "#{prop_name};TZID=#{tzid}:#{Calendar.strftime(local_ndt, "%Y%m%dT%H%M%S")}"
+
+          true ->
+            utc_dt = parse_iso_dt(target_rec_iso) || DateTime.utc_now()
+            local_ndt = utc_to_local_ndt(utc_dt, nil, vtimezones)
+            "#{prop_name}:#{Calendar.strftime(local_ndt, "%Y%m%dT%H%M%S")}"
+        end
+
+      _ ->
+        format_dt_prop(prop_name, target_rec_iso, nil, %{})
+    end
+  end
+
+  defp resolve_organizer_meta(existing_ev, new_attrs) do
+    explicit_email = non_empty_trimmed(Map.get(new_attrs, :organizer_email))
+    explicit_name = non_empty_trimmed(Map.get(new_attrs, :organizer_name))
+
+    existing_org = if existing_ev, do: Map.get(existing_ev, :organizer), else: nil
+    existing_email = if is_map(existing_org), do: non_empty_trimmed(existing_org[:email]), else: nil
+    existing_name = if is_map(existing_org), do: non_empty_trimmed(existing_org[:name]), else: nil
+
+    org_email =
+      explicit_email ||
+        existing_email ||
+        non_empty_trimmed(Application.get_env(:ukko, :thundermail_user)) ||
+        ""
+
+    org_name = explicit_name || existing_name || ""
+    {org_email, org_name}
+  end
+
+  defp single_event_details_changed?(nil, _new_attrs), do: true
+
+  defp single_event_details_changed?(existing_ev, new_attrs) do
+    new_title = String.trim(to_string(Map.get(new_attrs, :title) || ""))
+    new_loc = String.trim(to_string(Map.get(new_attrs, :location) || ""))
+    new_desc = String.trim(to_string(Map.get(new_attrs, :description) || ""))
+    new_rrule = sanitize_rrule(Map.get(new_attrs, :rrule))
+    old_rrule = sanitize_rrule(Map.get(existing_ev, :rrule_raw))
+
+    text_or_rrule_changed =
+      String.trim(existing_ev.summary || "") != new_title or
+        String.trim(existing_ev.location || "") != new_loc or
+        String.trim(existing_ev.description || "") != new_desc or
+        old_rrule != new_rrule
+
+    if text_or_rrule_changed do
+      true
+    else
+      not same_event_span?(existing_ev.dtstart, existing_ev.dtend, existing_ev.duration_sec, new_attrs.start, new_attrs.end)
+    end
+  end
+
+  defp recurring_occurrence_changed?(master_ev, matching_override_ev, scope, target_rec_iso, new_attrs) do
+    ref_ev = matching_override_ev || master_ev
+    new_title = String.trim(to_string(Map.get(new_attrs, :title) || ""))
+    new_loc = String.trim(to_string(Map.get(new_attrs, :location) || ""))
+    new_desc = String.trim(to_string(Map.get(new_attrs, :description) || ""))
+
+    rrule_changed =
+      scope == "following" and
+        sanitize_rrule(Map.get(new_attrs, :rrule)) != sanitize_rrule(Map.get(master_ev, :rrule_raw))
+
+    text_changed =
+      String.trim(ref_ev.summary || "") != new_title or
+        String.trim(ref_ev.location || "") != new_loc or
+        String.trim(ref_ev.description || "") != new_desc
+
+    cond do
+      rrule_changed or text_changed ->
+        true
+
+      not is_nil(matching_override_ev) ->
+        not same_event_span?(
+          matching_override_ev.dtstart,
+          matching_override_ev.dtend,
+          matching_override_ev.duration_sec,
+          new_attrs.start,
+          new_attrs.end
+        )
+
+      true ->
+        not same_occurrence_span?(master_ev, target_rec_iso, new_attrs.start, new_attrs.end)
+    end
+  end
+
+  defp same_event_span?({:date, %Date{} = old_s}, old_dtend, _dur_sec, new_start_iso, new_end_iso) do
+    if all_day_iso?(new_start_iso) do
+      old_e =
+        case old_dtend do
+          {:date, %Date{} = d} -> if Date.compare(d, old_s) in [:lt, :eq], do: Date.add(old_s, 1), else: d
+          _ -> Date.add(old_s, 1)
+        end
+
+      new_s = iso_to_date(new_start_iso)
+      new_e_raw = iso_to_date(new_end_iso || new_start_iso) || new_s
+
+      new_e =
+        if new_s && new_e_raw && Date.compare(new_e_raw, new_s) in [:lt, :eq],
+          do: Date.add(new_s, 1),
+          else: new_e_raw
+
+      new_s == old_s and new_e == old_e
+    else
+      false
+    end
+  end
+
+  defp same_event_span?({_, %DateTime{} = old_s_utc, _, _}, old_dtend, dur_sec, new_start_iso, new_end_iso) do
+    if all_day_iso?(new_start_iso) do
+      false
+    else
+      old_e_utc =
+        case old_dtend do
+          {_, %DateTime{} = dt, _, _} -> dt
+          _ -> DateTime.add(old_s_utc, dur_sec || 3600, :second)
+        end
+
+      case {parse_iso_dt(new_start_iso), parse_iso_dt(new_end_iso || new_start_iso)} do
+        {%DateTime{} = new_s, %DateTime{} = new_e} ->
+          abs(DateTime.diff(new_s, old_s_utc, :second)) < 60 and
+            abs(DateTime.diff(new_e, old_e_utc, :second)) < 60
+
+        _ ->
+          false
+      end
+    end
+  end
+
+  defp same_event_span?(_, _, _, _, _), do: false
+
+  defp same_occurrence_span?(master_ev, target_rec_iso, new_start_iso, new_end_iso) do
+    case master_ev.dtstart do
+      {:date, %Date{} = orig_s} ->
+        if all_day_iso?(new_start_iso) do
+          day_span =
+            case master_ev.dtend do
+              {:date, %Date{} = orig_e} -> max(Date.diff(orig_e, orig_s), 1)
+              _ -> 1
+            end
+
+          occ_s = iso_to_date(target_rec_iso)
+          new_s = iso_to_date(new_start_iso)
+          new_e = iso_to_date(new_end_iso || new_start_iso)
+
+          occ_s != nil and new_s == occ_s and new_e == Date.add(occ_s, day_span)
+        else
+          false
+        end
+
+      {_, %DateTime{} = orig_s_utc, _, _} ->
+        if all_day_iso?(new_start_iso) do
+          false
+        else
+          master_dur =
+            case master_ev.dtend do
+              {_, %DateTime{} = orig_e_utc, _, _} -> max(DateTime.diff(orig_e_utc, orig_s_utc, :second), 0)
+              _ -> master_ev.duration_sec || 3600
+            end
+
+          case {parse_iso_dt(target_rec_iso), parse_iso_dt(new_start_iso), parse_iso_dt(new_end_iso || new_start_iso)} do
+            {%DateTime{} = occ_s, %DateTime{} = new_s, %DateTime{} = new_e} ->
+              new_dur = max(DateTime.diff(new_e, new_s, :second), 0)
+              abs(DateTime.diff(new_s, occ_s, :second)) < 60 and abs(new_dur - master_dur) < 60
+
+            _ ->
+              false
+          end
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp extract_dtstart_tzid({:local, _, _, tz}) when is_binary(tz) and tz != "", do: tz
+  defp extract_dtstart_tzid(_), do: nil
+
+  defp all_day_iso?(iso) when is_binary(iso) do
+    trimmed = String.trim(iso)
+    String.length(trimmed) == 10 and match?({:ok, _}, Date.from_iso8601(trimmed))
+  end
+
+  defp all_day_iso?(_), do: false
+
+  defp choose_effective_tzid(requested_tz, fallback_tz, start_iso) do
+    if all_day_iso?(start_iso) do
+      nil
+    else
+      case supported_vtimezone(requested_tz) do
+        {canonical_tzid, _vt_block} -> canonical_tzid
+        nil -> non_empty_trimmed(fallback_tz)
+      end
+    end
+  end
+
+  defp ensure_vtimezone_blocks(existing_vt_blocks, nil), do: existing_vt_blocks
+  defp ensure_vtimezone_blocks(existing_vt_blocks, ""), do: existing_vt_blocks
+
+  defp ensure_vtimezone_blocks(existing_vt_blocks, tzid) when is_binary(tzid) do
+    already_present =
+      Enum.any?(existing_vt_blocks, fn vt ->
+        case Regex.run(~r/^TZID(?:;[^:]*)?:(.*)$/m, vt, capture: :all_but_first) do
+          [raw] -> String.upcase(clean_tzid(raw)) == String.upcase(clean_tzid(tzid))
+          _ -> false
+        end
+      end)
+
+    if already_present do
+      existing_vt_blocks
+    else
+      case supported_vtimezone(tzid) do
+        {_canonical, vt_block} -> existing_vt_blocks ++ [vt_block]
+        nil -> existing_vt_blocks
+      end
+    end
+  end
+
+  defp supported_vtimezone(nil), do: nil
+
+  defp supported_vtimezone(tzid) when is_binary(tzid) do
+    cleaned = clean_tzid(tzid)
+    up = String.upcase(cleaned)
+
+    cond do
+      up in ["", "UTC", "GMT", "ETC/UTC", "ETC/GMT", "Z"] ->
+        nil
+
+      up in ["AMERICA/LOS_ANGELES", "AMERICA/VANCOUVER", "AMERICA/TIJUANA", "US/PACIFIC", "CANADA/PACIFIC", "PST8PDT"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "America/Los_Angeles"
+        {canonical, us_dst_vtimezone(canonical, "-0800", "-0700", "PST", "PDT")}
+
+      up in ["AMERICA/PHOENIX", "US/ARIZONA"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "America/Phoenix"
+        {canonical, fixed_vtimezone(canonical, "-0700", "MST")}
+
+      up in ["AMERICA/DENVER", "AMERICA/EDMONTON", "AMERICA/BOISE", "US/MOUNTAIN", "MST7MDT"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "America/Denver"
+        {canonical, us_dst_vtimezone(canonical, "-0700", "-0600", "MST", "MDT")}
+
+      up in ["AMERICA/CHICAGO", "AMERICA/WINNIPEG", "US/CENTRAL", "CST6CDT"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "America/Chicago"
+        {canonical, us_dst_vtimezone(canonical, "-0600", "-0500", "CST", "CDT")}
+
+      up in ["AMERICA/NEW_YORK", "AMERICA/TORONTO", "AMERICA/DETROIT", "US/EASTERN", "EST5EDT"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "America/New_York"
+        {canonical, us_dst_vtimezone(canonical, "-0500", "-0400", "EST", "EDT")}
+
+      up in ["AMERICA/ANCHORAGE", "US/ALASKA"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "America/Anchorage"
+        {canonical, us_dst_vtimezone(canonical, "-0900", "-0800", "AKST", "AKDT")}
+
+      up in ["PACIFIC/HONOLULU", "US/HAWAII"] ->
+        canonical = if String.contains?(cleaned, "/"), do: cleaned, else: "Pacific/Honolulu"
+        {canonical, fixed_vtimezone(canonical, "-1000", "HST")}
+
+      up in ["EUROPE/LONDON", "EUROPE/DUBLIN", "EUROPE/LISBON"] ->
+        {cleaned, eu_dst_vtimezone(cleaned, "+0000", "+0100", "GMT", "BST")}
+
+      up in [
+        "EUROPE/PARIS",
+        "EUROPE/BERLIN",
+        "EUROPE/ROME",
+        "EUROPE/MADRID",
+        "EUROPE/AMSTERDAM",
+        "EUROPE/ZURICH",
+        "EUROPE/STOCKHOLM"
+      ] ->
+        {cleaned, eu_dst_vtimezone(cleaned, "+0100", "+0200", "CET", "CEST")}
+
+      up in ["EUROPE/HELSINKI", "EUROPE/ATHENS", "EUROPE/KYIV"] ->
+        {cleaned, eu_dst_vtimezone(cleaned, "+0200", "+0300", "EET", "EEST")}
+
+      up == "ASIA/TOKYO" ->
+        {cleaned, fixed_vtimezone(cleaned, "+0900", "JST")}
+
+      up in ["ASIA/SHANGHAI", "ASIA/HONG_KONG", "ASIA/SINGAPORE", "ASIA/TAIPEI"] ->
+        {cleaned, fixed_vtimezone(cleaned, "+0800", "CST")}
+
+      up in ["ASIA/KOLKATA", "ASIA/CALCUTTA"] ->
+        {cleaned, fixed_vtimezone(cleaned, "+0530", "IST")}
+
+      true ->
+        nil
+    end
+  end
+
+  defp supported_vtimezone(_), do: nil
+
+  defp us_dst_vtimezone(tzid, std_off, dst_off, std_name, dst_name) do
+    Enum.join(
+      [
+        "BEGIN:VTIMEZONE",
+        "TZID:#{tzid}",
+        "BEGIN:DAYLIGHT",
+        "TZOFFSETFROM:#{std_off}",
+        "TZOFFSETTO:#{dst_off}",
+        "TZNAME:#{dst_name}",
+        "DTSTART:19700308T020000",
+        "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+        "END:DAYLIGHT",
+        "BEGIN:STANDARD",
+        "TZOFFSETFROM:#{dst_off}",
+        "TZOFFSETTO:#{std_off}",
+        "TZNAME:#{std_name}",
+        "DTSTART:19701101T020000",
+        "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+        "END:STANDARD",
+        "END:VTIMEZONE"
+      ],
+      "\r\n"
+    )
+  end
+
+  defp eu_dst_vtimezone(tzid, std_off, dst_off, std_name, dst_name) do
+    Enum.join(
+      [
+        "BEGIN:VTIMEZONE",
+        "TZID:#{tzid}",
+        "BEGIN:DAYLIGHT",
+        "TZOFFSETFROM:#{std_off}",
+        "TZOFFSETTO:#{dst_off}",
+        "TZNAME:#{dst_name}",
+        "DTSTART:19700329T010000",
+        "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+        "END:DAYLIGHT",
+        "BEGIN:STANDARD",
+        "TZOFFSETFROM:#{dst_off}",
+        "TZOFFSETTO:#{std_off}",
+        "TZNAME:#{std_name}",
+        "DTSTART:19701025T020000",
+        "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+        "END:STANDARD",
+        "END:VTIMEZONE"
+      ],
+      "\r\n"
+    )
+  end
+
+  defp fixed_vtimezone(tzid, std_off, std_name) do
+    Enum.join(
+      [
+        "BEGIN:VTIMEZONE",
+        "TZID:#{tzid}",
+        "BEGIN:STANDARD",
+        "TZOFFSETFROM:#{std_off}",
+        "TZOFFSETTO:#{std_off}",
+        "TZNAME:#{std_name}",
+        "DTSTART:19700101T000000",
+        "END:STANDARD",
+        "END:VTIMEZONE"
+      ],
+      "\r\n"
+    )
+  end
+
+  defp utc_to_local_ndt(%DateTime{} = utc_dt, tzid, vtimezones) do
+    utc_ndt = DateTime.to_naive(DateTime.shift_zone!(utc_dt, "Etc/UTC"))
+    off1 = resolve_tz_offset_seconds(tzid, utc_ndt, vtimezones)
+    approx_local = NaiveDateTime.add(utc_ndt, off1, :second)
+    off2 = resolve_tz_offset_seconds(tzid, approx_local, vtimezones)
+    NaiveDateTime.add(utc_ndt, off2, :second)
+  end
+
+  defp override_matches_target?(inner, target_rec_iso, vtimezones) do
+    {props, _} = extract_block_props(inner)
+
+    case parse_dt_prop(Map.get(props, "RECURRENCE-ID"), vtimezones) do
+      nil ->
+        false
+
+      {:date, %Date{} = d} ->
+        case iso_to_date(target_rec_iso) do
+          %Date{} = td -> Date.compare(d, td) == :eq
+          _ -> false
+        end
+
+      {_, %DateTime{} = dt, _, _} ->
+        case parse_iso_dt(target_rec_iso) do
+          %DateTime{} = tdt -> abs(DateTime.diff(dt, tdt, :second)) < 60
+          _ -> false
+        end
+    end
+  end
+
+  defp override_before_target?(inner, target_rec_iso, vtimezones) do
+    {props, _} = extract_block_props(inner)
+
+    case parse_dt_prop(Map.get(props, "RECURRENCE-ID"), vtimezones) do
+      nil ->
+        false
+
+      {:date, %Date{} = d} ->
+        case iso_to_date(target_rec_iso) do
+          %Date{} = td -> Date.compare(d, td) == :lt
+          _ -> false
+        end
+
+      {_, %DateTime{} = dt, _, _} ->
+        case parse_iso_dt(target_rec_iso) do
+          %DateTime{} = tdt -> DateTime.diff(dt, tdt, :second) <= -60
+          _ -> false
+        end
+    end
+  end
+
+  defp first_occurrence?({:date, %Date{} = master_d}, target_rec_iso) do
+    case iso_to_date(target_rec_iso) do
+      %Date{} = td -> Date.compare(td, master_d) in [:lt, :eq]
+      _ -> false
+    end
+  end
+
+  defp first_occurrence?({_, %DateTime{} = master_utc, _, _}, target_rec_iso) do
+    case parse_iso_dt(target_rec_iso) do
+      %DateTime{} = tdt -> DateTime.diff(tdt, master_utc, :second) <= 60
+      _ -> false
+    end
+  end
+
+  defp first_occurrence?(_, _), do: false
+
+  defp compute_until_before({:date, _}, target_rec_iso) do
+    target_d = iso_to_date(target_rec_iso) || Date.utc_today()
+    Calendar.strftime(Date.add(target_d, -1), "%Y%m%d")
+  end
+
+  defp compute_until_before(_, target_rec_iso) do
+    target_dt = parse_iso_dt(target_rec_iso) || DateTime.utc_now()
+    iso8601_to_ical_utc(DateTime.add(target_dt, -1, :second))
+  end
+
+  defp replace_master_rrule_until(master_block, orig_rrule_raw, until_val) do
+    kept_parts =
+      orig_rrule_raw
+      |> String.split(";", trim: true)
+      |> Enum.reject(fn part ->
+        case String.split(part, "=", parts: 2) do
+          [k, _] -> String.upcase(String.trim(k)) in ["UNTIL", "COUNT"]
+          _ -> false
+        end
+      end)
+
+    new_rrule = Enum.join(kept_parts ++ ["UNTIL=#{until_val}"], ";")
+
+    master_block
+    |> :binary.split(["\r\n", "\n"], [:global, :trim_all])
+    |> Enum.map(fn line ->
+      if Regex.match?(~r/^RRULE(?:;[^:]*)?:/i, String.trim(line)) do
+        "RRULE:#{new_rrule}"
+      else
+        line
+      end
+    end)
+    |> Enum.join("\r\n")
+  end
+
+  defp adjust_rrule_for_following(
+         master_ev,
+         target_rec_iso,
+         new_attrs,
+         is_first,
+         following_tzid,
+         vtimezones
+       ) do
+    explicit_rrule = Map.get(new_attrs, :rrule)
+
+    cond do
+      # User explicitly selected "Does not repeat" in the edit modal
+      is_binary(explicit_rrule) and String.trim(explicit_rrule) == "" ->
+        nil
+
+      # User explicitly chose a different RRULE preset in the edit modal
+      is_binary(explicit_rrule) and sanitize_rrule(explicit_rrule) != sanitize_rrule(master_ev.rrule_raw) ->
+        sanitize_rrule(explicit_rrule)
+
+      true ->
+        base_parts =
+          master_ev.rrule_raw
+          |> String.split(";", trim: true)
+          |> Enum.map(fn part ->
+            case String.split(part, "=", parts: 2) do
+              [k, v] -> {String.upcase(String.trim(k)), String.trim(v)}
+              _ -> nil
+            end
+          end)
+          |> Enum.reject(&is_nil/1)
+
+        freq =
+          Enum.find_value(base_parts, "", fn
+            {"FREQ", v} -> String.upcase(v)
+            _ -> nil
+          end)
+
+        compare_tzid = following_tzid || extract_dtstart_tzid(master_ev.dtstart)
+        old_date = iso_to_date_in_tz(target_rec_iso, master_ev.dtstart, compare_tzid, vtimezones)
+        new_date = iso_to_date_in_tz(new_attrs.start, master_ev.dtstart, compare_tzid, vtimezones)
+
+        shifted_parts =
+          if old_date && new_date && Date.compare(old_date, new_date) != :eq do
+            shift_rrule_parts(base_parts, freq, old_date, new_date)
+          else
+            base_parts
+          end
+
+        final_parts =
+          if not is_first do
+            split_master_date = master_occ_date(master_ev.dtstart, target_rec_iso, vtimezones)
+            adjust_count_or_until_after_split(shifted_parts, master_ev, split_master_date, new_date)
+          else
+            shifted_parts
+          end
+
+        final_parts
+        |> Enum.map(fn {k, v} -> "#{k}=#{v}" end)
+        |> Enum.join(";")
+    end
+  end
+
+  defp iso_to_date_in_tz(iso, _master_dtstart, _tzid, _vtimezones) when not is_binary(iso), do: nil
+
+  defp iso_to_date_in_tz(iso, {:date, _}, _tzid, _vtimezones), do: iso_to_date(iso)
+
+  defp iso_to_date_in_tz(iso, _master_dtstart, tzid, vtimezones) do
+    cond do
+      all_day_iso?(iso) ->
+        iso_to_date(iso)
+
+      is_binary(tzid) and tzid != "" ->
+        case parse_iso_dt(iso) do
+          %DateTime{} = utc_dt ->
+            utc_dt |> utc_to_local_ndt(tzid, vtimezones) |> NaiveDateTime.to_date()
+
+          _ ->
+            iso_to_date(iso)
+        end
+
+      true ->
+        iso_to_date(iso)
+    end
+  end
+
+  defp master_occ_date({:date, _}, target_rec_iso, _vtimezones), do: iso_to_date(target_rec_iso)
+
+  defp master_occ_date({:local, _, _, tzid}, target_rec_iso, vtimezones) do
+    case parse_iso_dt(target_rec_iso) do
+      %DateTime{} = utc_dt ->
+        utc_dt |> utc_to_local_ndt(tzid, vtimezones) |> NaiveDateTime.to_date()
+
+      _ ->
+        iso_to_date(target_rec_iso)
+    end
+  end
+
+  defp master_occ_date(_, target_rec_iso, _vtimezones), do: iso_to_date(target_rec_iso)
+
+  defp shift_rrule_parts(parts, freq, %Date{} = old_date, %Date{} = new_date) do
+    old_wd = weekday_code(Date.day_of_week(old_date))
+    new_wd = weekday_code(Date.day_of_week(new_date))
+
+    Enum.map(parts, fn
+      {"BYDAY", val} when freq == "WEEKLY" ->
+        updated_days =
+          val
+          |> String.split(",", trim: true)
+          |> Enum.map(fn tok ->
+            up = String.upcase(String.trim(tok))
+            if up == old_wd, do: new_wd, else: up
+          end)
+          |> Enum.uniq()
+          |> Enum.join(",")
+
+        {"BYDAY", updated_days}
+
+      {"BYDAY", val} when freq == "MONTHLY" ->
+        case Regex.run(~r/^([+-]?\d+)(MO|TU|WE|TH|FR|SA|SU)$/i, String.trim(val), capture: :all_but_first) do
+          [_nth, _wd] ->
+            new_nth = div(new_date.day - 1, 7) + 1
+            {"BYDAY", "#{new_nth}#{new_wd}"}
+
+          _ ->
+            {"BYDAY", val}
+        end
+
+      {"BYMONTHDAY", val} when freq in ["MONTHLY", "YEARLY"] ->
+        if String.trim(val) == Integer.to_string(old_date.day) do
+          {"BYMONTHDAY", Integer.to_string(new_date.day)}
+        else
+          {"BYMONTHDAY", val}
+        end
+
+      {"BYMONTH", val} when freq == "YEARLY" ->
+        if String.trim(val) == Integer.to_string(old_date.month) do
+          {"BYMONTH", Integer.to_string(new_date.month)}
+        else
+          {"BYMONTH", val}
+        end
+
+      other ->
+        other
+    end)
+  end
+
+  defp adjust_count_or_until_after_split(parts, master_ev, %Date{} = split_date, %Date{} = new_date) do
+    Enum.flat_map(parts, fn
+      {"COUNT", count_str} ->
+        case parse_int(count_str, nil) do
+          total when is_integer(total) and total > 0 ->
+            start_d = extract_local_date(master_ev.dtstart)
+            prior_dates =
+              generate_rrule_dates(
+                Map.delete(master_ev.rrule, "COUNT"),
+                start_d,
+                start_d,
+                Date.add(split_date, -1),
+                master_ev.exdates
+              )
+
+            remaining = max(total - length(prior_dates), 1)
+            [{"COUNT", Integer.to_string(remaining)}]
+
+          _ ->
+            []
+        end
+
+      {"UNTIL", until_str} ->
+        case parse_until_date(until_str) do
+          %Date{} = ud ->
+            if Date.compare(new_date, ud) == :gt, do: [], else: [{"UNTIL", until_str}]
+
+          _ ->
+            [{"UNTIL", until_str}]
+        end
+
+      other ->
+        [other]
+    end)
+  end
+
+  defp adjust_count_or_until_after_split(parts, _master_ev, _split_date, _new_date), do: parts
+
+  defp iso_to_date(iso) when is_binary(iso) do
+    trimmed = String.trim(iso)
+
+    cond do
+      String.length(trimmed) >= 10 and match?({:ok, _}, Date.from_iso8601(String.slice(trimmed, 0, 10))) ->
+        {:ok, d} = Date.from_iso8601(String.slice(trimmed, 0, 10))
+        d
+
+      match?({:ok, _, _}, DateTime.from_iso8601(trimmed)) ->
+        {:ok, dt, _} = DateTime.from_iso8601(trimmed)
+        DateTime.to_date(dt)
+
+      true ->
+        nil
+    end
+  end
+
+  defp iso_to_date(_), do: nil
+
+  defp sanitize_rrule(nil), do: nil
+
+  defp sanitize_rrule(rrule) when is_binary(rrule) do
+    cleaned =
+      rrule
+      |> String.trim()
+      |> String.replace(~r/^RRULE:/i, "")
+      |> String.trim()
+
+    if cleaned != "" and Regex.match?(~r/FREQ=/i, cleaned) do
+      cleaned
+    else
+      nil
+    end
+  end
+
+  defp sanitize_rrule(_), do: nil
+
+  defp non_empty_trimmed(nil), do: nil
+
+  defp non_empty_trimmed(s) when is_binary(s) do
+    t = String.trim(s)
+    if t == "", do: nil, else: t
+  end
+
+  defp non_empty_trimmed(_), do: nil
 
   @doc """
   Normalizes a list of attendee maps or strings into `%{name: String.t(), email: String.t(), status: String.t()}` maps.
@@ -1420,14 +2685,23 @@ defmodule Ukko.ICal do
 
   def normalize_attendees(_), do: []
 
-  defp build_participant_lines(_organizer_email, []), do: []
+  defp build_participant_lines(_organizer_email, _organizer_name, []), do: []
 
-  defp build_participant_lines(organizer_email, attendees) do
+  defp build_participant_lines(organizer_email, organizer_name, attendees) do
     org_trimmed = String.trim(to_string(organizer_email))
+    org_name_trimmed = String.trim(to_string(organizer_name))
 
     organizer_lines =
       if org_trimmed != "" and String.contains?(org_trimmed, "@") do
-        ["ORGANIZER:mailto:#{org_trimmed}"]
+        org_cn =
+          if org_name_trimmed != "" and String.downcase(org_name_trimmed) != String.downcase(org_trimmed) do
+            safe_org = String.replace(org_name_trimmed, "\"", "'")
+            ~s(;CN="#{safe_org}")
+          else
+            ""
+          end
+
+        ["ORGANIZER#{org_cn}:mailto:#{org_trimmed}"]
       else
         []
       end
@@ -1450,14 +2724,28 @@ defmodule Ukko.ICal do
     organizer_lines ++ attendee_lines
   end
 
-  defp format_dt_prop(prop, iso) when is_binary(iso) do
+  defp format_dt_prop(prop, iso, tzid, vtimezones) when is_binary(iso) do
     trimmed = String.trim(iso)
 
-    if String.length(trimmed) == 10 and match?({:ok, _}, Date.from_iso8601(trimmed)) do
-      {:ok, date} = Date.from_iso8601(trimmed)
-      "#{prop};VALUE=DATE:#{Calendar.strftime(date, "%Y%m%d")}"
-    else
-      "#{prop}:#{iso8601_to_ical_utc(trimmed)}"
+    cond do
+      all_day_iso?(trimmed) ->
+        {:ok, date} = Date.from_iso8601(trimmed)
+        "#{prop};VALUE=DATE:#{Calendar.strftime(date, "%Y%m%d")}"
+
+      is_binary(tzid) and String.trim(tzid) != "" ->
+        clean_tz = clean_tzid(tzid)
+
+        case parse_iso_dt(trimmed) do
+          %DateTime{} = utc_dt ->
+            local_ndt = utc_to_local_ndt(utc_dt, clean_tz, vtimezones || %{})
+            "#{prop};TZID=#{clean_tz}:#{Calendar.strftime(local_ndt, "%Y%m%dT%H%M%S")}"
+
+          _ ->
+            "#{prop}:#{iso8601_to_ical_utc(trimmed)}"
+        end
+
+      true ->
+        "#{prop}:#{iso8601_to_ical_utc(trimmed)}"
     end
   end
 
