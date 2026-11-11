@@ -274,7 +274,7 @@ defmodule Ukko.ICal do
         summary = get_prop_text(props, "SUMMARY") || "(No Title)"
         description = get_prop_text(props, "DESCRIPTION") || ""
         location = get_prop_text(props, "LOCATION") || ""
-        location_url = get_prop_raw(props, "X-UKKO-LOCATION-URL")
+        location_url = sanitize_location_url(get_prop_text(props, "X-UKKO-LOCATION-URL"))
         rrule_str = get_prop_raw(props, "RRULE")
         dtend_info = parse_dt_prop(Map.get(props, "DTEND"), vtimezones)
         duration_sec = parse_duration_seconds(get_prop_raw(props, "DURATION"))
@@ -1333,9 +1333,11 @@ defmodule Ukko.ICal do
     dtstart = format_dt_prop("DTSTART", start_iso)
     dtend = format_dt_prop("DTEND", end_iso || start_iso)
 
+    clean_loc_url = sanitize_location_url(location_url)
+
     location_url_lines =
-      if is_binary(location_url) and String.trim(location_url) != "" do
-        ["X-UKKO-LOCATION-URL:#{String.trim(location_url)}"]
+      if is_binary(clean_loc_url) and clean_loc_url != "" do
+        ["X-UKKO-LOCATION-URL;VALUE=URI:#{clean_loc_url}"]
       else
         []
       end
@@ -1475,5 +1477,24 @@ defmodule Ukko.ICal do
     |> String.replace("\\,", ",")
     |> String.replace("\\;", ";")
     |> String.replace("\\\\", "\\")
+  end
+
+  @doc """
+  Cleans a stored `X-UKKO-LOCATION-URL` value, stripping any RFC 5545 backslash
+  escapes (`\\,`, `\\;`, `\\`) added by CalDAV servers that re-serialize `X-*`
+  properties as `TEXT`, and healing browser-normalized `/,` inside coordinate pairs
+  (e.g. `34.00752/,-118.12667` -> `34.00752,-118.12667`).
+  """
+  def sanitize_location_url(nil), do: nil
+
+  def sanitize_location_url(url) when is_binary(url) do
+    cleaned =
+      url
+      |> unescape_text()
+      |> String.trim()
+      |> String.replace("\\", "")
+      |> then(fn s -> Regex.replace(~r/(\d)\/,(-?\d)/, s, "\\1,\\2") end)
+
+    if cleaned == "", do: nil, else: cleaned
   end
 end

@@ -74,7 +74,7 @@
       : '';
 
   // App version state
-  let appVersion = '0.1.6';
+  let appVersion = '0.1.7';
 
   // Animating ASCII art state for THUNDERCAL
   const ASCII_THUNDER_BASE = [
@@ -1003,9 +1003,20 @@
     return 'Invited';
   }
 
+  function sanitizeMapQuestUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    return rawUrl
+      .trim()
+      .replace(/\\,/g, ',')
+      .replace(/\\;/g, ';')
+      .replace(/\\/g, '')
+      .replace(/(\d)\/,(-?\d)/g, '$1,$2');
+  }
+
   function buildMapQuestUrl(locationText, explicitUrl = '') {
-    if (explicitUrl && /^https:\/\/www\.mapquest\.com\//i.test(explicitUrl.trim())) {
-      return explicitUrl.trim();
+    const cleanedExplicit = sanitizeMapQuestUrl(explicitUrl);
+    if (cleanedExplicit && /^https:\/\/www\.mapquest\.com\//i.test(cleanedExplicit)) {
+      return cleanedExplicit;
     }
     const trimmed = (locationText || '').trim();
     if (!trimmed) return '';
@@ -1154,7 +1165,7 @@
       end: toLocalInputValue(ev.end || ev.start),
       all_day: Boolean(ev.allDay),
       location: ev.location || '',
-      location_url: ev.locationUrl || '',
+      location_url: sanitizeMapQuestUrl(ev.locationUrl || ''),
       description: ev.description || '',
       create_zoom: false,
       attendees: Array.isArray(ev.attendees) ? [...ev.attendees] : []
@@ -1298,7 +1309,7 @@
       start: startVal,
       end: endVal,
       location: ev.extendedProps?.location || '',
-      location_url: ev.extendedProps?.locationUrl || '',
+      location_url: sanitizeMapQuestUrl(ev.extendedProps?.locationUrl || ''),
       description: ev.extendedProps?.description || '',
       create_zoom: false,
       attendees: Array.isArray(ev.extendedProps?.attendees) ? ev.extendedProps.attendees : []
@@ -1363,7 +1374,7 @@
       start: ecEvent.start,
       end: ecEvent.end,
       location: ecEvent.extendedProps?.location || '',
-      locationUrl: ecEvent.extendedProps?.locationUrl || '',
+      locationUrl: sanitizeMapQuestUrl(ecEvent.extendedProps?.locationUrl || ''),
       description: ecEvent.extendedProps?.description || '',
       organizer: ecEvent.extendedProps?.organizer || null,
       attendees: Array.isArray(ecEvent.extendedProps?.attendees)
@@ -3227,6 +3238,8 @@
   .field input,
   .field textarea,
   .select-input {
+    width: 100%;
+    box-sizing: border-box;
     padding: 0.55rem 0.7rem;
     background: var(--bg-page);
     border: 1px solid var(--border-color);
@@ -3413,6 +3426,7 @@
 
   .attendee-input-wrapper {
     position: relative;
+    width: 100%;
   }
 
   .attendee-input-row {

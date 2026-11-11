@@ -121,7 +121,7 @@ defmodule Ukko.MapQuest do
   """
   def resolve_location_url(location, explicit_url \\ nil) do
     trimmed_loc = String.trim(to_string(location || ""))
-    trimmed_url = String.trim(to_string(explicit_url || ""))
+    trimmed_url = sanitize_url(explicit_url)
 
     cond do
       trimmed_loc == "" ->
@@ -137,6 +137,23 @@ defmodule Ukko.MapQuest do
         search_url(trimmed_loc)
     end
   end
+
+  @doc """
+  Strips RFC 5545 backslash escapes (`\\,`, `\\;`, `\\`) and repairs browser-normalized
+  `/,` inside coordinate pairs on MapQuest URLs.
+  """
+  def sanitize_url(nil), do: ""
+
+  def sanitize_url(url) when is_binary(url) do
+    url
+    |> String.trim()
+    |> String.replace("\\,", ",")
+    |> String.replace("\\;", ";")
+    |> String.replace("\\", "")
+    |> then(fn s -> Regex.replace(~r/(\d)\/,(-?\d)/, s, "\\1,\\2") end)
+  end
+
+  def sanitize_url(other), do: sanitize_url(to_string(other))
 
   defp get_api_key do
     case Application.get_env(:ukko, :mapquest_api_key) do

@@ -188,5 +188,45 @@ defmodule Ukko.ICalTest do
 
     assert event.locationUrl ==
              "https://www.mapquest.com/us/wv/charleston/25302-3932/1600-pennsylvania-ave-38.36025,-81.62115"
+
+    # CalDAV servers (like Stalwart) re-serialize default TEXT X-* properties with escaped commas (\,).
+    # Verify that escaped commas and previously browser-normalized `/,` coordinate paths heal cleanly.
+    stalwart_escaped_ics = """
+    BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VEVENT
+    UID:mq-evt-escaped
+    DTSTART:20261112T180000Z
+    DTEND:20261112T190000Z
+    SUMMARY:Montebello Event
+    LOCATION:509 Work St\\, Montebello\\, CA 90640-4948
+    X-UKKO-LOCATION-URL:https://www.mapquest.com/us/ca/montebello/90640-4948/509-work-st-34.00752\\,-118.12667
+    END:VEVENT
+    END:VCALENDAR
+    """
+
+    assert [escaped_ev] = ICal.parse_vevents(stalwart_escaped_ics)
+
+    assert escaped_ev.locationUrl ==
+             "https://www.mapquest.com/us/ca/montebello/90640-4948/509-work-st-34.00752,-118.12667"
+
+    corrupted_slash_ics = """
+    BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VEVENT
+    UID:mq-evt-slash
+    DTSTART:20261112T180000Z
+    DTEND:20261112T190000Z
+    SUMMARY:Montebello Event
+    LOCATION:509 Work St\\, Montebello\\, CA 90640-4948
+    X-UKKO-LOCATION-URL:https://www.mapquest.com/us/ca/montebello/90640-4948/509-work-st-34.00752/,-118.12667
+    END:VEVENT
+    END:VCALENDAR
+    """
+
+    assert [healed_ev] = ICal.parse_vevents(corrupted_slash_ics)
+
+    assert healed_ev.locationUrl ==
+             "https://www.mapquest.com/us/ca/montebello/90640-4948/509-work-st-34.00752,-118.12667"
   end
 end
