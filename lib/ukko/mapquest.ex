@@ -3,12 +3,15 @@ defmodule Ukko.MapQuest do
   MapQuest Search Ahead (Autocomplete) client and URL builder (`developer.mapquest.com`).
   """
 
+  alias Ukko.FastCache
+
   @prediction_url "https://www.mapquestapi.com/search/v3/prediction"
   @mapquest_web_base "https://www.mapquest.com"
+  @autocomplete_ttl_seconds 3600
 
   @doc """
   Queries MapQuest's Search Ahead v3 Prediction API (`address,poi,adminArea,airport`)
-  and returns a list of `%{display, name, type, url}` suggestion maps.
+  with a 1-hour ETS cache per query prefix and returns `%{display, name, type, url}` maps.
   """
   def autocomplete(query, limit \\ 6)
 
@@ -18,45 +21,53 @@ defmodule Ukko.MapQuest do
     if String.length(trimmed) < 2 do
       {:ok, []}
     else
-      with {:ok, api_key} <- get_api_key() do
-        params = [
-          key: api_key,
-          q: trimmed,
-          collection: "address,poi,adminArea,airport",
-          limit: limit
-        ]
+      cache_key = {:mapquest_q, String.downcase(trimmed), limit}
 
-        case Req.get(@prediction_url,
-               params: params,
-               receive_timeout: 5_000,
-               connect_options: [timeout: 4_000]
-             ) do
-          {:ok, %Req.Response{status: 200, body: %{"results" => results}}}
-          when is_list(results) ->
-            {:ok, parse_prediction_results(results)}
-
-          {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) ->
-            case Jason.decode(body) do
-              {:ok, %{"results" => results}} when is_list(results) ->
-                {:ok, parse_prediction_results(results)}
-
-              _ ->
-                {:ok, []}
-            end
-
-          {:ok, %Req.Response{status: status, body: body}} ->
-            {:error, {:mapquest_error, status, body}}
-
-          {:error, exception} ->
-            {:error, exception}
-        end
-      end
+      FastCache.fetch_ttl(cache_key, @autocomplete_ttl_seconds, fn ->
+        fetch_autocomplete_uncached(trimmed, limit)
+      end)
     end
   rescue
     e -> {:error, {:exception, Exception.message(e)}}
   end
 
   def autocomplete(_, _), do: {:ok, []}
+
+  defp fetch_autocomplete_uncached(trimmed, limit) do
+    with {:ok, api_key} <- get_api_key() do
+      params = [
+        key: api_key,
+        q: trimmed,
+        collection: "address,poi,adminArea,airport",
+        limit: limit
+      ]
+
+      case Req.get(@prediction_url,
+             params: params,
+             receive_timeout: 5_000,
+             connect_options: [timeout: 4_000]
+           ) do
+        {:ok, %Req.Response{status: 200, body: %{"results" => results}}}
+        when is_list(results) ->
+          {:ok, parse_prediction_results(results)}
+
+        {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) ->
+          case Jason.decode(body) do
+            {:ok, %{"results" => results}} when is_list(results) ->
+              {:ok, parse_prediction_results(results)}
+
+            _ ->
+              {:ok, []}
+          end
+
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, {:mapquest_error, status, body}}
+
+        {:error, exception} ->
+          {:error, exception}
+      end
+    end
+  end
 
   @doc """
   Parses raw MapQuest Search Ahead `results` list into normalized maps.

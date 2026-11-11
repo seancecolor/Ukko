@@ -10,6 +10,9 @@
   const THEME_KEY = 'ukko_theme';
   const NOTIF_SETTINGS_KEY = 'ukko_notification_settings';
   const NOTIFIED_EVENTS_KEY = 'ukko_notified_events';
+  const EVENTS_CACHE_KEY = 'ukko_events_cache_v1';
+  const CONTACTS_CACHE_KEY = 'ukko_contacts_cache_v1';
+  const HORIZON_DAYS = 90;
 
   const REMINDER_OPTIONS = [
     { label: 'At time of event', minutes: 0 },
@@ -47,6 +50,10 @@
   let bannerError = '';
   let bannerSuccess = '';
   let currentRange = { start: null, end: null };
+  let loadedHorizon = { startMs: 0, endMs: 0 };
+  let initialSyncDone = false;
+  let eventsFetchSeq = 0;
+  let eventsAbortController = null;
 
   // .ics file import state
   let icsFileInput;
@@ -74,7 +81,7 @@
       : '';
 
   // App version state
-  let appVersion = '0.1.8';
+  let appVersion = '0.1.9';
 
   // Animating ASCII art state for THUNDERCAL
   const ASCII_THUNDER_BASE = [
@@ -87,13 +94,16 @@
     '█     █████ █    ',
     '▀████ ▀   ▀ ▀▀▀▀▀'
   ];
+  const ASCII_THUNDER_STR = ASCII_THUNDER_BASE.join('\n');
+  const ASCII_CAL_STR = ASCII_CAL_BASE.join('\n');
   const ASCII_SPARK_CHARS = ['/', '\\', '*', '#', '+', '~'];
   const ASCII_TOTAL_COLS = ASCII_THUNDER_BASE[0].length + ASCII_CAL_BASE[0].length;
+  const ASCII_PAUSE_TICKS = 35;
 
   let asciiTick = 0;
   let asciiTimerId = null;
-  let asciiThunderText = ASCII_THUNDER_BASE.join('\n');
-  let asciiCalText = ASCII_CAL_BASE.join('\n');
+  let asciiThunderText = ASCII_THUNDER_STR;
+  let asciiCalText = ASCII_CAL_STR;
 
   function transformAsciiLines(baseLines, colOffset, waveCol, tickNum) {
     return baseLines
@@ -124,35 +134,67 @@
       .join('\n');
   }
 
-  function stepAsciiAnimation() {
-    // 59 columns + 35 ticks of calm pause between electric sweeps
-    const cycleLen = ASCII_TOTAL_COLS + 35;
-    const waveCol = (asciiTick % cycleLen) - 2;
-    asciiThunderText = transformAsciiLines(ASCII_THUNDER_BASE, 0, waveCol, asciiTick);
-    asciiCalText = transformAsciiLines(
-      ASCII_CAL_BASE,
-      ASCII_THUNDER_BASE[0].length,
-      waveCol,
-      asciiTick
-    );
-    asciiTick += 1;
+  function scheduleAsciiTick(delayMs) {
+    if (asciiTimerId) {
+      clearTimeout(asciiTimerId);
+    }
+    if (typeof document !== 'undefined' && document.hidden) {
+      asciiTimerId = null;
+      return;
+    }
+    asciiTimerId = setTimeout(runAsciiFrame, delayMs);
+  }
+
+  function runAsciiFrame() {
+    asciiTimerId = null;
+    if (typeof document !== 'undefined' && document.hidden) return;
+
+    const cycleLen = ASCII_TOTAL_COLS + ASCII_PAUSE_TICKS;
+    const phase = asciiTick % cycleLen;
+
+    if (phase <= ASCII_TOTAL_COLS + 4) {
+      const waveCol = phase - 2;
+      asciiThunderText = transformAsciiLines(ASCII_THUNDER_BASE, 0, waveCol, asciiTick);
+      asciiCalText = transformAsciiLines(
+        ASCII_CAL_BASE,
+        ASCII_THUNDER_BASE[0].length,
+        waveCol,
+        asciiTick
+      );
+      asciiTick += 1;
+      scheduleAsciiTick(55);
+    } else {
+      asciiThunderText = ASCII_THUNDER_STR;
+      asciiCalText = ASCII_CAL_STR;
+      const remainingPauseTicks = cycleLen - phase;
+      asciiTick += remainingPauseTicks;
+      scheduleAsciiTick(remainingPauseTicks * 55);
+    }
   }
 
   function triggerAsciiSurge() {
     asciiTick = 0;
-    stepAsciiAnimation();
+    runAsciiFrame();
   }
 
   function startAsciiAnimation() {
     stopAsciiAnimation();
-    stepAsciiAnimation();
-    asciiTimerId = setInterval(stepAsciiAnimation, 55);
+    runAsciiFrame();
   }
 
   function stopAsciiAnimation() {
     if (asciiTimerId) {
-      clearInterval(asciiTimerId);
+      clearTimeout(asciiTimerId);
       asciiTimerId = null;
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (typeof document === 'undefined') return;
+    if (document.hidden) {
+      stopAsciiAnimation();
+    } else if (!asciiTimerId) {
+      scheduleAsciiTick(120);
     }
   }
 
@@ -168,6 +210,8 @@
   let locationHighlightIndex = 0;
   let locationLoading = false;
   let locationDebounceTimer = null;
+  let locationAbortController = null;
+  const locationCache = new Map();
 
   // Create / Edit Event modal state
   const RRULE_PRESETS = [
@@ -494,6 +538,8 @@
       }
       authenticated = true;
       passcode = '';
+      hydrateCachedEvents();
+      hydrateCachedContacts();
       await tick();
       initCalendar();
       fetchSubscriptions();
@@ -507,33 +553,174 @@
   }
 
   function handleLogout() {
+    if (eventsAbortController) {
+      eventsAbortController.abort();
+      eventsAbortController = null;
+    }
     token = '';
     authenticated = false;
-    localStorage.removeItem(TOKEN_KEY);
+    events = [];
+    contacts = [];
+    loadedHorizon = { startMs: 0, endMs: 0 };
+    initialSyncDone = false;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(EVENTS_CACHE_KEY);
+      localStorage.removeItem(CONTACTS_CACHE_KEY);
+    }
     stopNotificationTimers();
     destroyCalendar();
   }
 
-  async function fetchEvents(rangeStart, rangeEnd) {
+  function mapApiEvents(data) {
+    if (!Array.isArray(data)) return [];
+    return data.map((ev) => {
+      const allDay = isEventAllDay(ev);
+      const rawStart = ev.start;
+      const rawEnd = ev.end || ev.start;
+      const bgColor = ev.backgroundColor || ev.color || ev.extendedProps?.color;
+      const readOnly = Boolean(ev.readOnly || ev.extendedProps?.readOnly);
+      const isRecurring = Boolean(ev.isRecurring || ev.extendedProps?.isRecurring);
+      const rrule = ev.rrule ?? ev.extendedProps?.rrule ?? '';
+      const recurrenceId = ev.recurrenceId ?? ev.extendedProps?.recurrenceId ?? '';
+      const calendarName = ev.calendarName || ev.extendedProps?.calendarName || 'Thundercal';
+
+      const mapped = {
+        id: ev.id || ev.uid,
+        title: ev.title || '(No Title)',
+        allDay,
+        editable: !readOnly,
+        startEditable: !readOnly,
+        durationEditable: !readOnly,
+        start: allDay ? String(rawStart).slice(0, 10) : parseTimedDate(rawStart),
+        end: allDay ? String(rawEnd).slice(0, 10) : parseTimedDate(rawEnd),
+        extendedProps: {
+          uid: ev.uid || ev.id,
+          allDay,
+          description: ev.description ?? ev.extendedProps?.description ?? '',
+          location: ev.location ?? ev.extendedProps?.location ?? '',
+          locationUrl: ev.locationUrl ?? ev.extendedProps?.locationUrl ?? '',
+          organizer: ev.organizer ?? ev.extendedProps?.organizer ?? null,
+          attendees: Array.isArray(ev.attendees)
+            ? ev.attendees
+            : Array.isArray(ev.extendedProps?.attendees)
+              ? ev.extendedProps.attendees
+              : [],
+          isRecurring,
+          rrule,
+          recurrenceId,
+          readOnly,
+          calendarName,
+          color: bgColor || '#2563eb'
+        }
+      };
+
+      if (bgColor) {
+        mapped.backgroundColor = bgColor;
+        mapped.color = bgColor;
+      }
+
+      return mapped;
+    });
+  }
+
+  function hydrateCachedEvents() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(EVENTS_CACHE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.items) && parsed.items.length > 0) {
+        events = mapApiEvents(parsed.items);
+      }
+    } catch {
+      // ignore invalid cache
+    }
+  }
+
+  function persistCachedEvents(rawItems) {
+    if (typeof localStorage === 'undefined' || !Array.isArray(rawItems)) return;
+    try {
+      localStorage.setItem(EVENTS_CACHE_KEY, JSON.stringify({ ts: Date.now(), items: rawItems }));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+
+  function hydrateCachedContacts() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(CONTACTS_CACHE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        contacts = parsed;
+      }
+    } catch {
+      // ignore invalid cache
+    }
+  }
+
+  async function fetchEvents(rangeStart, rangeEnd, opts = {}) {
     if (!authenticated) return;
+    const { force = false, serverRefresh = false } = opts;
+
+    const rawStart = rangeStart || currentRange.start;
+    const rawEnd = rangeEnd || currentRange.end;
+    const reqStartMs = rawStart ? new Date(rawStart).getTime() : NaN;
+    const reqEndMs = rawEnd ? new Date(rawEnd).getTime() : NaN;
+
+    // Instant client-side navigation when requested window is already inside our ±90-day horizon
+    if (
+      !force &&
+      !serverRefresh &&
+      initialSyncDone &&
+      !Number.isNaN(reqStartMs) &&
+      !Number.isNaN(reqEndMs) &&
+      loadedHorizon.startMs > 0 &&
+      loadedHorizon.endMs > 0 &&
+      reqStartMs >= loadedHorizon.startMs &&
+      reqEndMs <= loadedHorizon.endMs
+    ) {
+      return;
+    }
+
+    const dayMs = 24 * 60 * 60 * 1000;
+    const horizonPaddingMs = HORIZON_DAYS * dayMs;
+    const fetchStartMs = !Number.isNaN(reqStartMs)
+      ? reqStartMs - horizonPaddingMs
+      : loadedHorizon.startMs || Date.now() - horizonPaddingMs;
+    const fetchEndMs = !Number.isNaN(reqEndMs)
+      ? reqEndMs + horizonPaddingMs
+      : loadedHorizon.endMs || Date.now() + horizonPaddingMs;
+
+    if (eventsAbortController) {
+      eventsAbortController.abort();
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    eventsAbortController = controller;
+    const seq = ++eventsFetchSeq;
+
     loadingEvents = true;
     bannerError = '';
 
-    const startParam = rangeStart || currentRange.start;
-    const endParam = rangeEnd || currentRange.end;
-
     const params = new URLSearchParams();
-    if (startParam) params.set('start', new Date(startParam).toISOString());
-    if (endParam) params.set('end', new Date(endParam).toISOString());
+    params.set('start', new Date(fetchStartMs).toISOString());
+    params.set('end', new Date(fetchEndMs).toISOString());
+    if (serverRefresh) {
+      params.set('refresh', '1');
+    }
 
     try {
-      const query = params.toString();
-      const url = query ? `/api/events?${query}` : '/api/events';
+      const url = `/api/events?${params.toString()}`;
       const res = await fetch(url, {
         method: 'GET',
         credentials: 'same-origin',
-        headers: authHeaders({ Accept: 'application/json' })
+        headers: authHeaders({ Accept: 'application/json' }),
+        signal: controller ? controller.signal : undefined
       });
+
+      if (seq !== eventsFetchSeq) return;
 
       if (res.status === 401) {
         handleLogout();
@@ -547,66 +734,26 @@
         return;
       }
 
-      events = Array.isArray(data)
-        ? data.map((ev) => {
-            const allDay = isEventAllDay(ev);
-            const rawStart = ev.start;
-            const rawEnd = ev.end || ev.start;
-            const bgColor = ev.backgroundColor || ev.color || ev.extendedProps?.color;
-            const readOnly = Boolean(ev.readOnly || ev.extendedProps?.readOnly);
-            const isRecurring = Boolean(ev.isRecurring || ev.extendedProps?.isRecurring);
-            const rrule = ev.rrule ?? ev.extendedProps?.rrule ?? '';
-            const recurrenceId = ev.recurrenceId ?? ev.extendedProps?.recurrenceId ?? '';
-            const calendarName =
-              ev.calendarName || ev.extendedProps?.calendarName || 'Thundercal';
-
-            const mapped = {
-              id: ev.id || ev.uid,
-              title: ev.title || '(No Title)',
-              allDay,
-              editable: !readOnly,
-              startEditable: !readOnly,
-              durationEditable: !readOnly,
-              start: allDay ? String(rawStart).slice(0, 10) : parseTimedDate(rawStart),
-              end: allDay ? String(rawEnd).slice(0, 10) : parseTimedDate(rawEnd),
-              extendedProps: {
-                uid: ev.uid || ev.id,
-                allDay,
-                description: ev.description ?? ev.extendedProps?.description ?? '',
-                location: ev.location ?? ev.extendedProps?.location ?? '',
-                locationUrl: ev.locationUrl ?? ev.extendedProps?.locationUrl ?? '',
-                organizer: ev.organizer ?? ev.extendedProps?.organizer ?? null,
-                attendees: Array.isArray(ev.attendees)
-                  ? ev.attendees
-                  : Array.isArray(ev.extendedProps?.attendees)
-                    ? ev.extendedProps.attendees
-                    : [],
-                isRecurring,
-                rrule,
-                recurrenceId,
-                readOnly,
-                calendarName,
-                color: bgColor || '#2563eb'
-              }
-            };
-
-            if (bgColor) {
-              mapped.backgroundColor = bgColor;
-              mapped.color = bgColor;
-            }
-
-            return mapped;
-          })
-        : [];
+      const rawItems = Array.isArray(data) ? data : [];
+      events = mapApiEvents(rawItems);
+      loadedHorizon = { startMs: fetchStartMs, endMs: fetchEndMs };
+      initialSyncDone = true;
+      persistCachedEvents(rawItems);
 
       if (calendar) {
         calendar.setOption('events', events);
       }
       checkUpcomingNotifications();
     } catch (err) {
-      bannerError = 'Network error while fetching calendar events.';
+      if (err?.name === 'AbortError') return;
+      if (seq === eventsFetchSeq) {
+        bannerError = 'Network error while fetching calendar events.';
+      }
     } finally {
-      loadingEvents = false;
+      if (seq === eventsFetchSeq) {
+        loadingEvents = false;
+        eventsAbortController = null;
+      }
     }
   }
 
@@ -653,7 +800,7 @@
 
       const count = data.imported || 1;
       bannerSuccess = `Successfully imported ${count} event${count === 1 ? '' : 's'} from .ics file.`;
-      await fetchEvents();
+      await fetchEvents(null, null, { force: true });
     } catch (err) {
       bannerError = 'Failed to read or upload .ics file.';
     } finally {
@@ -789,7 +936,7 @@
       }
 
       await fetchSubscriptions();
-      await fetchEvents();
+      await fetchEvents(null, null, { force: true });
       subForm = {
         name: '',
         url: '',
@@ -815,7 +962,7 @@
       });
       if (res.ok) {
         await fetchSubscriptions();
-        await fetchEvents();
+        await fetchEvents(null, null, { force: true });
       }
     } catch {
       // ignore
@@ -835,7 +982,7 @@
       });
       if (res.ok) {
         await fetchSubscriptions();
-        await fetchEvents();
+        await fetchEvents(null, null, { force: true });
       }
     } catch {
       // ignore
@@ -851,7 +998,7 @@
       });
       if (res.ok) {
         await fetchSubscriptions();
-        await fetchEvents();
+        await fetchEvents(null, null, { force: true });
       }
     } catch {
       // ignore
@@ -884,6 +1031,13 @@
         const data = await res.json().catch(() => []);
         if (Array.isArray(data)) {
           contacts = data;
+          if (typeof localStorage !== 'undefined') {
+            try {
+              localStorage.setItem(CONTACTS_CACHE_KEY, JSON.stringify(data));
+            } catch {
+              // ignore storage quota errors
+            }
+          }
         }
       }
     } catch {
@@ -1061,29 +1215,58 @@
   async function fetchLocationSuggestions(query) {
     const q = (query || '').trim();
     if (q.length < 2 || isUrl(q)) {
+      if (locationAbortController) {
+        locationAbortController.abort();
+        locationAbortController = null;
+      }
       locationSuggestions = [];
       locationLoading = false;
       return;
     }
+
+    const cacheKey = q.toLowerCase();
+    if (locationCache.has(cacheKey)) {
+      locationSuggestions = locationCache.get(cacheKey);
+      locationHighlightIndex = 0;
+      locationLoading = false;
+      return;
+    }
+
+    if (locationAbortController) {
+      locationAbortController.abort();
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    locationAbortController = controller;
 
     locationLoading = true;
     try {
       const res = await fetch(`/api/locations/autocomplete?q=${encodeURIComponent(q)}`, {
         method: 'GET',
         credentials: 'same-origin',
-        headers: authHeaders({ Accept: 'application/json' })
+        headers: authHeaders({ Accept: 'application/json' }),
+        signal: controller ? controller.signal : undefined
       });
       if (res.ok) {
         const data = await res.json().catch(() => []);
-        if (Array.isArray(data) && eventForm.location.trim() === q) {
-          locationSuggestions = data;
-          locationHighlightIndex = 0;
+        if (Array.isArray(data)) {
+          if (locationCache.size > 100) {
+            const firstKey = locationCache.keys().next().value;
+            locationCache.delete(firstKey);
+          }
+          locationCache.set(cacheKey, data);
+          if (eventForm.location.trim() === q) {
+            locationSuggestions = data;
+            locationHighlightIndex = 0;
+          }
         }
       }
-    } catch {
-      // ignore transient network error
+    } catch (err) {
+      if (err?.name === 'AbortError') return;
     } finally {
-      locationLoading = false;
+      if (locationAbortController === controller) {
+        locationLoading = false;
+        locationAbortController = null;
+      }
     }
   }
 
@@ -1515,7 +1698,7 @@
       editingIsRecurring = false;
       editingRecurrenceId = '';
       editingOriginalRrule = '';
-      await fetchEvents();
+      await fetchEvents(null, null, { force: true });
     } catch (err) {
       formError = 'Network error while saving event.';
     } finally {
@@ -1573,7 +1756,7 @@
         editingIsRecurring = false;
         editingRecurrenceId = '';
       }
-      await fetchEvents();
+      await fetchEvents(null, null, { force: true });
     } catch {
       recurringScopeError = 'Network error while updating recurring event.';
     } finally {
@@ -1709,7 +1892,11 @@
         }
         return item;
       });
+      if (calendar) {
+        calendar.setOption('events', events);
+      }
       checkUpcomingNotifications();
+      fetchEvents(null, null, { force: true });
     } catch (err) {
       info.revert();
       bannerError = 'Network error while updating moved event.';
@@ -1782,7 +1969,7 @@
       }
 
       selectedEvent = null;
-      await fetchEvents();
+      await fetchEvents(null, null, { force: true });
     } catch (err) {
       deleteError = 'Network error while deleting event.';
     } finally {
@@ -1836,7 +2023,7 @@
 
       showRecurringDeleteModal = false;
       selectedEvent = null;
-      await fetchEvents();
+      await fetchEvents(null, null, { force: true });
     } catch {
       recurringDeleteError = 'Network error while deleting recurring event.';
     } finally {
@@ -2130,7 +2317,7 @@
     // Refresh events in the background every 10 minutes while the tab is open
     backgroundSyncIntervalId = setInterval(() => {
       if (authenticated && !loadingEvents) {
-        fetchEvents();
+        fetchEvents(null, null, { force: true });
       }
     }, 10 * 60_000);
   }
@@ -2207,9 +2394,14 @@
   onMount(() => {
     initTheme();
     initNotifications();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
     startAsciiAnimation();
     fetchAppVersion();
     if (authenticated) {
+      hydrateCachedEvents();
+      hydrateCachedContacts();
       initCalendar();
       fetchSubscriptions();
       fetchContacts();
@@ -2218,6 +2410,17 @@
   });
 
   onDestroy(() => {
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }
+    if (eventsAbortController) {
+      eventsAbortController.abort();
+      eventsAbortController = null;
+    }
+    if (locationAbortController) {
+      locationAbortController.abort();
+      locationAbortController = null;
+    }
     stopAsciiAnimation();
     stopNotificationTimers();
     destroyCalendar();
@@ -2345,7 +2548,7 @@
         <button
           type="button"
           class="btn btn-secondary"
-          on:click={() => fetchEvents()}
+          on:click={() => fetchEvents(null, null, { force: true, serverRefresh: true })}
           disabled={loadingEvents}
         >
           Refresh

@@ -374,4 +374,32 @@ defmodule Ukko.ICalTest do
              "2026-11-26T02:00:00Z"
            ]
   end
+
+  test "FastCache.extract_xml_tag_bodies extracts CDATA and XML-escaped WebDAV blocks" do
+    multistatus_xml = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+      <D:response>
+        <D:propstat>
+          <D:prop>
+            <C:calendar-data><![CDATA[BEGIN:VCALENDAR
+    SUMMARY:Q&A <Live>
+    END:VCALENDAR]]></C:calendar-data>
+          </D:prop>
+        </D:propstat>
+      </D:response>
+      <D:response>
+        <D:propstat>
+          <D:prop>
+            <calendar-data content-type="text/calendar">BEGIN:VCALENDAR&#13;&#10;SUMMARY:R&amp;D &quot;Sync&quot; &lt;Team&gt;&#13;&#10;END:VCALENDAR</calendar-data>
+          </D:prop>
+        </D:propstat>
+      </D:response>
+    </D:multistatus>
+    """
+
+    [first, second] = Ukko.FastCache.extract_xml_tag_bodies(multistatus_xml, "calendar-data")
+    assert first =~ "SUMMARY:Q&A <Live>"
+    assert second == "BEGIN:VCALENDAR\r\nSUMMARY:R&D \"Sync\" <Team>\r\nEND:VCALENDAR"
+  end
 end

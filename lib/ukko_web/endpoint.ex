@@ -9,9 +9,15 @@ defmodule UkkoWeb.Endpoint do
   ]
 
   plug Plug.Static,
+    at: "/assets",
+    from: {:ukko, "priv/static/assets"},
+    gzip: true,
+    headers: [{"cache-control", "public, max-age=31536000, immutable"}]
+
+  plug Plug.Static,
     at: "/",
     from: :ukko,
-    gzip: false,
+    gzip: true,
     only: UkkoWeb.static_paths()
 
   if code_reloading? do

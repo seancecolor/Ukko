@@ -4,16 +4,49 @@ defmodule Ukko.CalDAV do
   """
 
   import SweetXml
-  alias Ukko.ICal
+  alias Ukko.{FastCache, ICal}
+
+  @caldav_soft_ttl_seconds 45
 
   @doc """
-  Fetches calendar events between `start_iso` and `end_iso` (optional) via a WebDAV `REPORT`
-  request (`calendar-query`), parses the XML `<multistatus>` response with `SweetXml`,
-  and extracts all `.ics` `VEVENT` items.
+  Fetches calendar events between `start_iso` and `end_iso` (optional), backed by
+  `Ukko.FastCache` Stale-While-Revalidate ETS caching for sub-millisecond reads and
+  instant range navigation. Pass `force_refresh: true` to bypass cache on manual refresh.
   """
-  def list_events(start_iso \\ nil, end_iso \\ nil) do
+  def list_events(start_iso \\ nil, end_iso \\ nil, opts \\ []) do
+    force_refresh = Keyword.get(opts, :force_refresh, false)
+
+    case FastCache.fetch_swr(
+           FastCache.caldav_key(),
+           @caldav_soft_ttl_seconds,
+           force_refresh,
+           &fetch_all_parsed_calendars/0
+         ) do
+      {:ok, parsed_calendars} ->
+        events =
+          Enum.flat_map(parsed_calendars, fn parsed_cal ->
+            ICal.expand_parsed_calendar(parsed_cal, start_iso, end_iso)
+          end)
+
+        {:ok, events}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  @doc """
+  Warms the primary CalDAV ETS cache on startup or in the background.
+  """
+  def warm_cache do
+    list_events(nil, nil, force_refresh: true)
+  end
+
+  defp fetch_all_parsed_calendars do
     with {:ok, cfg} <- get_config() do
-      xml_body = build_report_xml(start_iso, end_iso)
+      xml_body = build_report_xml(nil, nil)
 
       case Req.request(
              method: "REPORT",
@@ -31,8 +64,15 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
-          events = parse_multistatus_response(to_string(body), start_iso, end_iso)
-          {:ok, events}
+          parsed_calendars =
+            body
+            |> to_string()
+            |> FastCache.extract_xml_tag_bodies("calendar-data")
+            |> Enum.reject(fn ics -> String.trim(ics) == "" end)
+            |> Enum.map(&ICal.parse_calendar_data/1)
+            |> Enum.reject(fn {_vtz, raw_vevents, _overrides} -> raw_vevents == [] end)
+
+          {:ok, parsed_calendars}
 
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {:caldav_error, status, body}}
@@ -84,6 +124,10 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 201, 204] ->
+          unless String.contains?(resource_url, "ukko-subscriptions-config") do
+            FastCache.invalidate_caldav()
+          end
+
           :ok
 
         {:ok, %Req.Response{status: status, body: body}} ->
@@ -151,29 +195,41 @@ defmodule Ukko.CalDAV do
       {:error, :no_events_found}
     else
       results =
-        Enum.map(chunks, fn {uid, single_ics} ->
-          case put_raw_ics(uid, single_ics) do
-            {:ok, ^uid} ->
-              {:ok, uid}
+        chunks
+        |> Task.async_stream(
+          fn {uid, single_ics} ->
+            case put_raw_ics(uid, single_ics) do
+              {:ok, ^uid} ->
+                {:ok, uid}
 
-            {:error, _} ->
-              # Fallback: rebuild normalized .ics if server rejected vendor properties
-              case ICal.parse_vevents(single_ics) do
-                [ev | _] ->
-                  put_event(%{
-                    uid: uid,
-                    title: ev.title,
-                    start: ev.start,
-                    end: ev.end,
-                    description: ev.description,
-                    location: ev.location
-                  })
+              {:error, _} ->
+                # Fallback: rebuild normalized .ics if server rejected vendor properties
+                case ICal.parse_vevents(single_ics) do
+                  [ev | _] ->
+                    put_event(%{
+                      uid: uid,
+                      title: ev.title,
+                      start: ev.start,
+                      end: ev.end,
+                      description: ev.description,
+                      location: ev.location
+                    })
 
-                [] ->
-                  {:error, :invalid_event}
-              end
-          end
+                  [] ->
+                    {:error, :invalid_event}
+                end
+            end
+          end,
+          max_concurrency: 6,
+          timeout: 35_000,
+          on_timeout: :kill_task
+        )
+        |> Enum.map(fn
+          {:ok, res} -> res
+          {:exit, reason} -> {:error, {:import_timeout, reason}}
         end)
+
+      FastCache.invalidate_caldav()
 
       case Enum.find(results, &match?({:error, _}, &1)) do
         nil ->
@@ -206,6 +262,7 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 202, 204] ->
+          FastCache.invalidate_caldav()
           :ok
 
         {:ok, %Req.Response{status: 404}} ->
@@ -218,6 +275,7 @@ defmodule Ukko.CalDAV do
                   decode_body: false
                 )
 
+              FastCache.invalidate_caldav()
               :ok
 
             _ ->
@@ -232,6 +290,7 @@ defmodule Ukko.CalDAV do
                   )
               end
 
+              FastCache.invalidate_caldav()
               :ok
           end
 
@@ -288,14 +347,7 @@ defmodule Ukko.CalDAV do
   single RFC 5545 `VCALENDAR` document.
   """
   def build_combined_ics(xml_body) when is_binary(xml_body) do
-    ics_blobs =
-      xml_body
-      |> xpath(~x"//*[local-name()='calendar-data']"l)
-      |> Enum.map(fn node ->
-        node
-        |> xpath(~x"./text()"ls)
-        |> Enum.join("")
-      end)
+    ics_blobs = FastCache.extract_xml_tag_bodies(xml_body, "calendar-data")
 
     vtimezones =
       ics_blobs
@@ -343,18 +395,13 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Parses a CalDAV `<multistatus>` XML body using `SweetXml` and returns a list of parsed VEVENT maps.
+  Parses a CalDAV `<multistatus>` XML body and returns a list of parsed VEVENT maps.
   """
   def parse_multistatus_response(xml_body, start_iso \\ nil, end_iso \\ nil)
       when is_binary(xml_body) do
     xml_body
-    |> xpath(~x"//*[local-name()='calendar-data']"l)
-    |> Enum.flat_map(fn node ->
-      ics_data =
-        node
-        |> xpath(~x"./text()"ls)
-        |> Enum.join("")
-
+    |> FastCache.extract_xml_tag_bodies("calendar-data")
+    |> Enum.flat_map(fn ics_data ->
       ICal.parse_vevents(ics_data, start_iso, end_iso)
     end)
   rescue

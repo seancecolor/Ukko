@@ -1,18 +1,32 @@
 defmodule Ukko.CardDAV do
   @moduledoc """
-  Thundermail CardDAV client using `Req` and `SweetXml` for fetching contacts
-  and providing attendee autocomplete suggestions.
+  Thundermail CardDAV client using `Req` and `Ukko.FastCache` for fetching contacts
+  and providing fast attendee autocomplete suggestions.
   """
 
-  import SweetXml
+  alias Ukko.FastCache
 
   @default_carddav_base "https://mail.thundermail.com/dav/card/"
+  @contacts_soft_ttl_seconds 900
 
   @doc """
-  Fetches contacts from the user's Thundermail CardDAV addressbook via a WebDAV
-  `REPORT` (`addressbook-query`) request and parses all returned `VCARD` blocks.
+  Fetches contacts from the user's Thundermail CardDAV addressbook, backed by a 15-minute
+  Stale-While-Revalidate ETS cache so `/api/contacts` responds in sub-millisecond time.
   """
-  def list_contacts do
+  def list_contacts(opts \\ []) do
+    force_refresh = Keyword.get(opts, :force_refresh, false)
+
+    FastCache.fetch_swr(
+      FastCache.contacts_key(),
+      @contacts_soft_ttl_seconds,
+      force_refresh,
+      &fetch_contacts_uncached/0
+    )
+  rescue
+    e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  defp fetch_contacts_uncached do
     with {:ok, cfg} <- get_config() do
       case Req.request(
              method: "REPORT",
@@ -23,7 +37,9 @@ defmodule Ukko.CardDAV do
                {"content-type", "application/xml; charset=utf-8"}
              ],
              body: build_addressbook_query_xml(),
-             decode_body: false
+             decode_body: false,
+             receive_timeout: 20_000,
+             connect_options: [timeout: 10_000]
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
           contacts = parse_multistatus_vcards(to_string(body))
@@ -45,15 +61,8 @@ defmodule Ukko.CardDAV do
   """
   def parse_multistatus_vcards(xml_body) when is_binary(xml_body) do
     xml_body
-    |> xpath(~x"//*[local-name()='address-data']"l)
-    |> Enum.flat_map(fn node ->
-      vcard_data =
-        node
-        |> xpath(~x"./text()"ls)
-        |> Enum.join("")
-
-      parse_vcards(vcard_data)
-    end)
+    |> FastCache.extract_xml_tag_bodies("address-data")
+    |> Enum.flat_map(&parse_vcards/1)
     |> deduplicate_contacts()
   rescue
     _ -> []

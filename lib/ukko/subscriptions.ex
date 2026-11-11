@@ -122,8 +122,11 @@ defmodule Ukko.Subscriptions do
 
   @doc """
   Fetches and parses events from all enabled subscribed calendars within `[start_iso, end_iso]`.
+  Pass `force_refresh: true` to bypass the SWR cache on manual refresh.
   """
-  def fetch_events(start_iso \\ nil, end_iso \\ nil) do
+  def fetch_events(start_iso \\ nil, end_iso \\ nil, opts \\ []) do
+    force_refresh = Keyword.get(opts, :force_refresh, false)
+
     subs =
       list_subscriptions()
       |> Enum.filter(fn sub -> Map.get(sub, "enabled", true) != false end)
@@ -136,7 +139,7 @@ defmodule Ukko.Subscriptions do
         fn sub ->
           url = Map.get(sub, "url", "")
 
-          case fetch_remote_parsed_calendar(url, false) do
+          case fetch_remote_parsed_calendar(url, force_refresh) do
             {:ok, parsed_cal} ->
               ICal.expand_parsed_calendar(parsed_cal, start_iso, end_iso, %{
                 color: Map.get(sub, "color", @default_color),
@@ -159,6 +162,33 @@ defmodule Ukko.Subscriptions do
     end
   rescue
     _ -> []
+  end
+
+  @doc """
+  Warms all enabled subscribed `.ics` feeds asynchronously in the background.
+  """
+  def warm_all_async do
+    list_subscriptions()
+    |> Enum.filter(fn sub -> Map.get(sub, "enabled", true) != false end)
+    |> Enum.each(fn sub ->
+      url = Map.get(sub, "url", "")
+
+      if is_binary(url) and url != "" do
+        now = System.system_time(:second)
+
+        case :ets.lookup(@table, {:parsed_feed, url}) do
+          [{{:parsed_feed, ^url}, _parsed_cal, expires_at}] when expires_at > now ->
+            :ok
+
+          _ ->
+            refresh_feed_async(url)
+        end
+      end
+    end)
+
+    :ok
+  rescue
+    _ -> :ok
   end
 
   @doc """
@@ -284,6 +314,11 @@ defmodule Ukko.Subscriptions do
 
         :ets.insert(@table, {:subscriptions, updated_list})
         save_to_caldav_async(updated_list, token)
+
+        if Map.get(updated_sub, "enabled", true) != false do
+          refresh_feed_async(Map.get(updated_sub, "url", ""))
+        end
+
         {:reply, {:ok, updated_sub}, state}
     end
   end
@@ -368,37 +403,85 @@ defmodule Ukko.Subscriptions do
   defp fetch_remote_parsed_calendar(url, bypass_cache) do
     now = System.system_time(:second)
 
-    cached_parsed =
-      if bypass_cache do
-        nil
-      else
-        case :ets.lookup(@table, {:parsed_feed, url}) do
-          [{{:parsed_feed, ^url}, parsed_cal, expires_at}] when expires_at > now ->
-            parsed_cal
-
-          _ ->
-            nil
-        end
-      end
-
-    if not is_nil(cached_parsed) do
-      {:ok, cached_parsed}
+    if bypass_cache do
+      fetch_and_parse_sync(url, true)
     else
-      case fetch_remote_ics(url, bypass_cache) do
-        {:ok, ics_str} ->
-          parsed_cal = ICal.parse_calendar_data(ics_str)
-          :ets.insert(@table, {{:parsed_feed, url}, parsed_cal, now + @feed_ttl_seconds})
+      case :ets.lookup(@table, {:parsed_feed, url}) do
+        [{{:parsed_feed, ^url}, parsed_cal, expires_at}] when expires_at > now ->
           {:ok, parsed_cal}
 
-        {:error, reason} ->
-          # Fallback to stale parsed calendar in ETS if available
-          case :ets.lookup(@table, {:parsed_feed, url}) do
-            [{{:parsed_feed, ^url}, stale_parsed, _}] -> {:ok, stale_parsed}
-            _ -> {:error, reason}
-          end
+        [{{:parsed_feed, ^url}, stale_parsed, _expired_at}] ->
+          refresh_feed_async(url)
+          {:ok, stale_parsed}
+
+        [] ->
+          fetch_and_parse_sync(url, false)
       end
     end
   end
+
+  defp fetch_and_parse_sync(url, bypass_cache) do
+    case fetch_remote_ics(url, bypass_cache) do
+      {:ok, ics_str} ->
+        case :ets.lookup(@table, {:parsed_feed, url}) do
+          [{{:parsed_feed, ^url}, parsed_cal, _}] ->
+            {:ok, parsed_cal}
+
+          _ ->
+            parsed_cal = ICal.parse_calendar_data(ics_str)
+
+            :ets.insert(
+              @table,
+              {{:parsed_feed, url}, parsed_cal, System.system_time(:second) + @feed_ttl_seconds}
+            )
+
+            {:ok, parsed_cal}
+        end
+
+      {:error, reason} ->
+        # Fallback to stale parsed calendar in ETS if available
+        case :ets.lookup(@table, {:parsed_feed, url}) do
+          [{{:parsed_feed, ^url}, stale_parsed, _}] -> {:ok, stale_parsed}
+          _ -> {:error, reason}
+        end
+    end
+  end
+
+  defp refresh_feed_async(url) when is_binary(url) and url != "" do
+    if :ets.whereis(@table) != :undefined do
+      now = System.system_time(:second)
+      lock_key = {:refreshing_feed, url}
+
+      can_acquire =
+        case :ets.lookup(@table, lock_key) do
+          [{^lock_key, lock_until}] when lock_until > now ->
+            false
+
+          [{^lock_key, _expired}] ->
+            :ets.delete(@table, lock_key)
+            :ets.insert_new(@table, {lock_key, now + 30})
+
+          [] ->
+            :ets.insert_new(@table, {lock_key, now + 30})
+        end
+
+      if can_acquire do
+        Task.start(fn ->
+          try do
+            _ = fetch_remote_ics(url, true)
+          after
+            if :ets.whereis(@table) != :undefined do
+              :ets.delete(@table, lock_key)
+            end
+          end
+        end)
+      end
+    end
+
+    :ok
+  end
+
+  defp refresh_feed_async(_), do: :ok
 
   defp fetch_remote_ics(url, bypass_cache) do
     now = System.system_time(:second)

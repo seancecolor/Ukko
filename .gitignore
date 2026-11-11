@@ -4,6 +4,7 @@
 /*.ez
 /priv/static/assets/
 /priv/static/index.html
+/priv/static/index.html.gz
 /priv/static/logo.jpg
 /priv/static/favicon.ico
 /priv/static/favicon.png

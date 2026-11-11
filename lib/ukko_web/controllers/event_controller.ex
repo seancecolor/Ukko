@@ -4,14 +4,17 @@ defmodule UkkoWeb.EventController do
   alias Ukko.{CalDAV, CardDAV, ICal, MapQuest, Subscriptions, Zoom}
 
   @doc """
-  GET /api/events?start=ISO8601&end=ISO8601
+  GET /api/events?start=ISO8601&end=ISO8601&refresh=1
   """
   def index(conn, params) do
     start_iso = Map.get(params, "start")
     end_iso = Map.get(params, "end")
+    force_refresh = truthy?(Map.get(params, "refresh", false))
 
-    caldav_task = Task.async(fn -> CalDAV.list_events(start_iso, end_iso) end)
-    sub_events = Subscriptions.fetch_events(start_iso, end_iso)
+    caldav_task =
+      Task.async(fn -> CalDAV.list_events(start_iso, end_iso, force_refresh: force_refresh) end)
+
+    sub_events = Subscriptions.fetch_events(start_iso, end_iso, force_refresh: force_refresh)
 
     case Task.await(caldav_task, 45_000) do
       {:ok, events} ->
