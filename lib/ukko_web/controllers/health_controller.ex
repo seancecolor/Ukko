@@ -5,7 +5,7 @@ defmodule UkkoWeb.HealthController do
     version =
       case Application.spec(:ukko, :vsn) do
         vsn when is_list(vsn) -> List.to_string(vsn)
-        _ -> "0.1.9"
+        _ -> "1.0.1"
       end
 
     conn

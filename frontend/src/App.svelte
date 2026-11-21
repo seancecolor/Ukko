@@ -12,7 +12,21 @@
   const NOTIFIED_EVENTS_KEY = 'ukko_notified_events';
   const EVENTS_CACHE_KEY = 'ukko_events_cache_v1';
   const CONTACTS_CACHE_KEY = 'ukko_contacts_cache_v1';
+  const LAYOUT_MODE_KEY = 'ukko_layout_mode';
+  const MOBILE_VIEW_KEY = 'ukko_mobile_view';
   const HORIZON_DAYS = 90;
+
+  const ThreeDayPlugin = {
+    createOptions(options) {
+      if (options.views?.timeGridWeek) {
+        options.views.timeGridThreeDay = {
+          ...options.views.timeGridWeek,
+          buttonText: '3-Day',
+          duration: { days: 3 }
+        };
+      }
+    }
+  };
 
   const REMINDER_OPTIONS = [
     { label: 'At time of event', minutes: 0 },
@@ -81,7 +95,60 @@
       : '';
 
   // App version state
-  let appVersion = '0.1.9';
+  let appVersion = '1.0.1';
+
+  // Mobile detection & layout state (iPhone / Firefox iOS FxiOS / responsive viewport)
+  function checkIsMobileEnv() {
+    if (typeof window === 'undefined') return false;
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+    const isPhoneUa = /\b(iPhone|iPod|FxiOS|CriOS|Android.*Mobile|Windows Phone|Mobile)\b/i.test(ua);
+    const isNarrowViewport = window.matchMedia
+      ? window.matchMedia('(max-width: 768px)').matches
+      : window.innerWidth <= 768;
+    return isPhoneUa || isNarrowViewport;
+  }
+
+  let detectedMobile = checkIsMobileEnv();
+  let layoutMode =
+    typeof localStorage !== 'undefined'
+      ? localStorage.getItem(LAYOUT_MODE_KEY) || 'auto'
+      : 'auto';
+  let mobileMediaQuery = null;
+  let showMobileMenu = false;
+
+  const VALID_MOBILE_TABS = ['agenda', 'timeGridDay', 'timeGridThreeDay', 'dayGridMonth'];
+  let mobileTab = (() => {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem(MOBILE_VIEW_KEY);
+      if (saved && VALID_MOBILE_TABS.includes(saved)) return saved;
+    }
+    return 'agenda';
+  })();
+
+  function startOfLocalDay(d) {
+    const dt = d instanceof Date ? new Date(d.getTime()) : new Date(d);
+    if (Number.isNaN(dt.getTime())) {
+      const fallback = new Date();
+      fallback.setHours(0, 0, 0, 0);
+      return fallback;
+    }
+    dt.setHours(0, 0, 0, 0);
+    return dt;
+  }
+
+  function toLocalDateKey(d) {
+    const dt = startOfLocalDay(d);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+  }
+
+  let mobileFocusDate = startOfLocalDay(new Date());
+  let calendarViewTitle = '';
+  let mobileAgendaScrollEl = null;
+  let touchSwipeStart = null;
+
+  $: isMobile =
+    layoutMode === 'mobile' ? true : layoutMode === 'desktop' ? false : detectedMobile;
 
   // Animating ASCII art state for THUNDERCAL
   const ASCII_THUNDER_BASE = [
@@ -381,6 +448,271 @@
     };
   }
 
+  function formatMobileSlotLabel(date) {
+    if (date.getMinutes() !== 0) {
+      return { html: '<span class="tz-mobile-slot"></span>' };
+    }
+    const localShort = localHourFormatter
+      .format(date)
+      .replace(/\s*AM/i, 'a')
+      .replace(/\s*PM/i, 'p');
+    const estShort = estHourFormatter
+      .format(date)
+      .replace(/\s*AM/i, 'a')
+      .replace(/\s*PM/i, 'p');
+    return {
+      html: `<span class="tz-mobile-slot"><span class="tz-m-local">${localShort}</span><span class="tz-m-est">${estShort}</span></span>`
+    };
+  }
+
+  function createMobileSidebarHeader() {
+    return {
+      html: `<span class="tz-header-only tz-mobile-header"><span>${localTzLabel}</span><span class="tz-m-est">${estTzLabel}</span></span><span class="tz-allday-only">all&#8209;day</span>`
+    };
+  }
+
+  function handleMobileViewportChange() {
+    detectedMobile = checkIsMobileEnv();
+  }
+
+  function setLayoutMode(nextMode) {
+    layoutMode = nextMode;
+    if (typeof localStorage !== 'undefined') {
+      if (nextMode === 'auto') {
+        localStorage.removeItem(LAYOUT_MODE_KEY);
+      } else {
+        localStorage.setItem(LAYOUT_MODE_KEY, nextMode);
+      }
+    }
+    showMobileMenu = false;
+  }
+
+  function eventOccursOnLocalDay(ev, dayStart) {
+    const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+    const dayKey = toLocalDateKey(dayStart);
+    const isAllDay = Boolean(ev.allDay || ev.extendedProps?.allDay);
+
+    if (isAllDay) {
+      const sKey =
+        ev.start instanceof Date ? toLocalDateKey(ev.start) : String(ev.start || '').slice(0, 10);
+      const rawEndKey = ev.end
+        ? ev.end instanceof Date
+          ? toLocalDateKey(ev.end)
+          : String(ev.end).slice(0, 10)
+        : sKey;
+      if (!sKey) return false;
+      if (rawEndKey <= sKey) return dayKey === sKey;
+      return dayKey >= sKey && dayKey < rawEndKey;
+    }
+
+    const sDate = ev.start instanceof Date ? ev.start : new Date(ev.start);
+    if (Number.isNaN(sDate.getTime())) return false;
+    const eDate = ev.end ? (ev.end instanceof Date ? ev.end : new Date(ev.end)) : sDate;
+    const effectiveEnd = Number.isNaN(eDate.getTime()) || eDate <= sDate ? sDate : eDate;
+    if (effectiveEnd.getTime() === sDate.getTime()) {
+      return sDate >= dayStart && sDate < dayEnd;
+    }
+    return sDate < dayEnd && effectiveEnd > dayStart;
+  }
+
+  function sortDayEvents(list) {
+    return [...list].sort((a, b) => {
+      const aAll = Boolean(a.allDay || a.extendedProps?.allDay);
+      const bAll = Boolean(b.allDay || b.extendedProps?.allDay);
+      if (aAll !== bAll) return aAll ? -1 : 1;
+      const aMs = (a.start instanceof Date ? a.start : new Date(a.start)).getTime() || 0;
+      const bMs = (b.start instanceof Date ? b.start : new Date(b.start)).getTime() || 0;
+      return aMs - bMs;
+    });
+  }
+
+  $: mobileAgendaGroups = (() => {
+    if (!isMobile) return [];
+    const baseDay = startOfLocalDay(mobileFocusDate);
+    const todayKey = toLocalDateKey(new Date());
+    const groups = [];
+    const horizonDaysCount = 30;
+
+    for (let offset = 0; offset < horizonDaysCount; offset++) {
+      const d = new Date(baseDay.getTime());
+      d.setDate(d.getDate() + offset);
+      const dayStart = startOfLocalDay(d);
+      const key = toLocalDateKey(dayStart);
+      const matching = sortDayEvents(events.filter((ev) => eventOccursOnLocalDay(ev, dayStart)));
+
+      if (offset === 0 || matching.length > 0) {
+        groups.push({
+          key,
+          date: dayStart,
+          isToday: key === todayKey,
+          weekdayLabel: dayStart.toLocaleDateString('en-US', { weekday: 'short' }),
+          dateLabel: dayStart.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: dayStart.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined
+          }),
+          items: matching
+        });
+      }
+    }
+    return groups;
+  })();
+
+  $: mobileSelectedDayEvents = (() => {
+    if (!isMobile) return [];
+    const dayStart = startOfLocalDay(mobileFocusDate);
+    return sortDayEvents(events.filter((ev) => eventOccursOnLocalDay(ev, dayStart)));
+  })();
+
+  $: mobileNavTitle = (() => {
+    if (mobileTab === 'agenda') {
+      const endD = new Date(mobileFocusDate.getTime());
+      endD.setDate(endD.getDate() + 29);
+      const startFmt = mobileFocusDate.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric'
+      });
+      const endFmt = endD.toLocaleDateString('en-US', {
+        month: mobileFocusDate.getMonth() === endD.getMonth() ? undefined : 'short',
+        day: 'numeric'
+      });
+      return `${startFmt} – ${endFmt}`;
+    }
+    if (calendarViewTitle) return calendarViewTitle;
+    return mobileFocusDate.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric'
+    });
+  })();
+
+  function formatAgendaEventTime(ev) {
+    if (ev.allDay || ev.extendedProps?.allDay) {
+      return { primary: 'All day', secondary: '' };
+    }
+    const s = ev.start instanceof Date ? ev.start : new Date(ev.start);
+    if (Number.isNaN(s.getTime())) return { primary: '', secondary: '' };
+    const e = ev.end ? (ev.end instanceof Date ? ev.end : new Date(ev.end)) : null;
+    const sLocal = localHourMinFormatter.format(s);
+    const eLocal =
+      e && !Number.isNaN(e.getTime()) && e.getTime() !== s.getTime()
+        ? localHourMinFormatter.format(e)
+        : '';
+    const sEst = estHourMinFormatter.format(s);
+    return {
+      primary: eLocal ? `${sLocal} – ${eLocal}` : sLocal,
+      secondary: `${sEst} EST`
+    };
+  }
+
+  function isMeetingUrl(loc) {
+    if (!isUrl(loc)) return false;
+    return /zoom\.us|meet\.google\.com|teams\.microsoft\.com|webex\.com/i.test(loc);
+  }
+
+  function switchMobileTab(nextTab) {
+    if (!VALID_MOBILE_TABS.includes(nextTab)) return;
+    mobileTab = nextTab;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(MOBILE_VIEW_KEY, nextTab);
+    }
+    if (calendar && nextTab !== 'agenda') {
+      calendar.setOption('view', nextTab);
+      calendar.setOption('date', mobileFocusDate);
+      calendar.setOption(
+        'highlightedDates',
+        nextTab === 'dayGridMonth' ? [mobileFocusDate] : []
+      );
+      const v = calendar.getView?.();
+      if (v?.title) calendarViewTitle = v.title;
+    }
+  }
+
+  function mobileStepDate(direction) {
+    if (mobileTab === 'agenda') {
+      const next = new Date(mobileFocusDate.getTime());
+      next.setDate(next.getDate() + direction * 7);
+      mobileFocusDate = startOfLocalDay(next);
+      fetchEvents(
+        mobileFocusDate,
+        new Date(mobileFocusDate.getTime() + 30 * 24 * 60 * 60 * 1000)
+      );
+      if (mobileAgendaScrollEl) {
+        mobileAgendaScrollEl.scrollTop = 0;
+      }
+      return;
+    }
+    if (calendar) {
+      if (direction < 0) {
+        calendar.prev();
+      } else {
+        calendar.next();
+      }
+      const d = calendar.getOption('date');
+      if (d) {
+        mobileFocusDate = startOfLocalDay(d);
+        if (mobileTab === 'dayGridMonth') {
+          calendar.setOption('highlightedDates', [mobileFocusDate]);
+        }
+      }
+      const v = calendar.getView?.();
+      if (v?.title) calendarViewTitle = v.title;
+    }
+  }
+
+  function mobileGoToday() {
+    const today = startOfLocalDay(new Date());
+    mobileFocusDate = today;
+    if (calendar) {
+      calendar.setOption('date', today);
+      if (mobileTab === 'dayGridMonth') {
+        calendar.setOption('highlightedDates', [today]);
+      }
+      const v = calendar.getView?.();
+      if (v?.title) calendarViewTitle = v.title;
+    }
+    if (mobileAgendaScrollEl) {
+      mobileAgendaScrollEl.scrollTop = 0;
+    }
+  }
+
+  function handleMobileTouchStart(e) {
+    if (!e.touches || e.touches.length !== 1) {
+      touchSwipeStart = null;
+      return;
+    }
+    touchSwipeStart = {
+      x: e.touches[0].clientX,
+      y: e.touches[0].clientY,
+      t: Date.now()
+    };
+  }
+
+  function handleMobileTouchEnd(e) {
+    if (!touchSwipeStart || !e.changedTouches || e.changedTouches.length !== 1) {
+      touchSwipeStart = null;
+      return;
+    }
+    const dx = e.changedTouches[0].clientX - touchSwipeStart.x;
+    const dy = e.changedTouches[0].clientY - touchSwipeStart.y;
+    const elapsed = Date.now() - touchSwipeStart.t;
+    touchSwipeStart = null;
+
+    if (elapsed < 600 && Math.abs(dx) > 64 && Math.abs(dx) > Math.abs(dy) * 1.8) {
+      mobileStepDate(dx < 0 ? 1 : -1);
+    }
+  }
+
+  function applyTheme() {
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle('dark', darkMode);
+      const metaTheme = document.getElementById('theme-color-meta');
+      if (metaTheme) {
+        metaTheme.setAttribute('content', darkMode ? '#0f172a' : '#f8fafc');
+      }
+    }
+  }
+
   function initTheme() {
     if (typeof window === 'undefined') return;
     const saved = localStorage.getItem(THEME_KEY);
@@ -390,12 +722,6 @@
       darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
     applyTheme();
-  }
-
-  function applyTheme() {
-    if (typeof document !== 'undefined') {
-      document.documentElement.classList.toggle('dark', darkMode);
-    }
   }
 
   function toggleTheme() {
@@ -2333,15 +2659,72 @@
     }
   }
 
+  let lastAppliedMobileMode = null;
+
+  function syncCalendarLayoutOptions(mobileActive) {
+    if (!calendar) return;
+    calendar.setOption(
+      'headerToolbar',
+      mobileActive
+        ? { start: '', center: '', end: '' }
+        : {
+            start: 'prev,next today',
+            center: 'title',
+            end: 'dayGridMonth,timeGridWeek,timeGridDay'
+          }
+    );
+    calendar.setOption(
+      'slotLabelFormat',
+      mobileActive ? formatMobileSlotLabel : formatDualSlotLabel
+    );
+    calendar.setOption(
+      'allDayContent',
+      mobileActive ? createMobileSidebarHeader : createDualSidebarHeader
+    );
+    calendar.setOption('eventLongPressDelay', mobileActive ? 350 : 1000);
+
+    if (mobileActive) {
+      const targetGridView = mobileTab === 'agenda' ? 'timeGridDay' : mobileTab;
+      calendar.setOption('view', targetGridView);
+      calendar.setOption('date', mobileFocusDate);
+      calendar.setOption(
+        'highlightedDates',
+        targetGridView === 'dayGridMonth' ? [mobileFocusDate] : []
+      );
+    } else {
+      calendar.setOption('highlightedDates', []);
+      if (calendar.getOption('view') === 'timeGridThreeDay') {
+        calendar.setOption('view', 'timeGridWeek');
+      }
+    }
+
+    const v = calendar.getView?.();
+    if (v?.title) calendarViewTitle = v.title;
+  }
+
+  $: if (calendar && lastAppliedMobileMode !== isMobile) {
+    lastAppliedMobileMode = isMobile;
+    syncCalendarLayoutOptions(isMobile);
+  }
+
   function initCalendar() {
     if (!calendarEl || calendar) return;
+
+    const initialGridView = isMobile
+      ? mobileTab === 'agenda'
+        ? 'timeGridDay'
+        : mobileTab
+      : 'timeGridWeek';
+
+    lastAppliedMobileMode = isMobile;
 
     calendar = new Calendar({
       target: calendarEl,
       props: {
-        plugins: [DayGrid, TimeGrid, Interaction],
+        plugins: [DayGrid, TimeGrid, ThreeDayPlugin, Interaction],
         options: {
-          view: 'timeGridWeek',
+          view: initialGridView,
+          date: mobileFocusDate,
           height: '100%',
           scrollTime: '08:00:00',
           selectable: true,
@@ -2349,23 +2732,41 @@
           eventStartEditable: true,
           eventDurationEditable: true,
           eventResizableFromStart: true,
+          eventLongPressDelay: isMobile ? 350 : 1000,
           nowIndicator: true,
-          slotLabelFormat: formatDualSlotLabel,
-          allDayContent: createDualSidebarHeader,
-          headerToolbar: {
-            start: 'prev,next today',
-            center: 'title',
-            end: 'dayGridMonth,timeGridWeek,timeGridDay'
-          },
+          highlightedDates:
+            isMobile && initialGridView === 'dayGridMonth' ? [mobileFocusDate] : [],
+          slotLabelFormat: isMobile ? formatMobileSlotLabel : formatDualSlotLabel,
+          allDayContent: isMobile ? createMobileSidebarHeader : createDualSidebarHeader,
+          headerToolbar: isMobile
+            ? { start: '', center: '', end: '' }
+            : {
+                start: 'prev,next today',
+                center: 'title',
+                end: 'dayGridMonth,timeGridWeek,timeGridDay'
+              },
           events: events,
           datesSet: (info) => {
             currentRange = { start: info.start, end: info.end };
+            if (info.view?.title) {
+              calendarViewTitle = info.view.title;
+            }
             fetchEvents(info.start, info.end);
           },
           select: (info) => {
+            if (isMobile && mobileTab === 'dayGridMonth') {
+              mobileFocusDate = startOfLocalDay(info.start);
+              calendar?.setOption('highlightedDates', [mobileFocusDate]);
+              return;
+            }
             openCreateModal(info.start, info.end, info.allDay);
           },
           dateClick: (info) => {
+            if (isMobile && mobileTab === 'dayGridMonth') {
+              mobileFocusDate = startOfLocalDay(info.date);
+              calendar?.setOption('highlightedDates', [mobileFocusDate]);
+              return;
+            }
             const start = info.date;
             const end = new Date(start.getTime() + 60 * 60 * 1000);
             openCreateModal(start, end, info.allDay);
@@ -2388,12 +2789,21 @@
     if (calendar) {
       calendar.destroy();
       calendar = null;
+      lastAppliedMobileMode = null;
     }
   }
 
   onMount(() => {
     initTheme();
     initNotifications();
+    if (typeof window !== 'undefined') {
+      detectedMobile = checkIsMobileEnv();
+      window.addEventListener('resize', handleMobileViewportChange, { passive: true });
+      if (window.matchMedia) {
+        mobileMediaQuery = window.matchMedia('(max-width: 768px)');
+        mobileMediaQuery.addEventListener?.('change', handleMobileViewportChange);
+      }
+    }
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibilityChange);
     }
@@ -2410,6 +2820,13 @@
   });
 
   onDestroy(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('resize', handleMobileViewportChange);
+      if (mobileMediaQuery) {
+        mobileMediaQuery.removeEventListener?.('change', handleMobileViewportChange);
+        mobileMediaQuery = null;
+      }
+    }
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     }
@@ -2427,8 +2844,9 @@
   });
 </script>
 
+<div class="app-root" class:is-mobile={isMobile}>
 {#if !authenticated}
-  <main class="auth-screen">
+  <main class="auth-screen" class:auth-screen-mobile={isMobile}>
     <form class="auth-card" on:submit={handleLogin}>
       <div class="auth-header-row">
         <div class="auth-header">
@@ -2436,6 +2854,7 @@
             class="logo-lockup logo-lockup-auth"
             aria-label="Thundercal"
             on:mouseenter={triggerAsciiSurge}
+            on:touchstart={triggerAsciiSurge}
             role="img"
           >
             <img class="logo-mark-img" src="/logo.png" alt="Thundercal logo" />
@@ -2477,7 +2896,7 @@
     </form>
   </main>
 {:else}
-  <main class="container">
+  <main class="container" class:container-mobile={isMobile}>
     <input
       type="file"
       accept=".ics,text/calendar"
@@ -2487,92 +2906,185 @@
       on:change={handleIcsFileSelected}
     />
 
-    <header class="header">
-      <div class="header-left">
+    {#if isMobile}
+      <header class="mobile-topbar">
         <div
-          class="logo-lockup"
+          class="logo-lockup logo-lockup-mobile"
           aria-label="Thundercal"
-          on:mouseenter={triggerAsciiSurge}
+          on:touchstart={triggerAsciiSurge}
           role="img"
         >
           <img class="logo-mark-img" src="/logo.png" alt="Thundercal logo" />
-          <div class="ascii-wordmark" aria-hidden="true">
+          <div class="ascii-wordmark ascii-wordmark-mobile" aria-hidden="true">
             <pre class="ascii-part ascii-thunder">{asciiThunderText}</pre>
             <pre class="ascii-part ascii-cal">{asciiCalText}</pre>
           </div>
+          {#if loadingEvents || importingIcs}
+            <span class="mobile-sync-dot" title={importingIcs ? 'Importing .ics...' : 'Syncing...'}></span>
+          {/if}
         </div>
-        {#if loadingEvents || importingIcs}
-          <span class="status-pill">
-            {importingIcs ? 'Importing .ics...' : 'Syncing...'}
-          </span>
-        {/if}
-      </div>
 
-      <div class="header-actions">
+        <div class="mobile-topbar-actions">
+          <button
+            type="button"
+            class="mobile-icon-btn"
+            class:is-spinning={loadingEvents}
+            on:click={() => fetchEvents(null, null, { force: true, serverRefresh: true })}
+            disabled={loadingEvents}
+            aria-label="Refresh calendar"
+            title="Refresh"
+          >
+            ↻
+          </button>
+          <button
+            type="button"
+            class="mobile-icon-btn"
+            on:click={toggleTheme}
+            aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {darkMode ? '☀️' : '🌙'}
+          </button>
+          <button
+            type="button"
+            class="mobile-icon-btn mobile-menu-trigger"
+            on:click={() => (showMobileMenu = true)}
+            aria-label="Open menu"
+          >
+            ☰
+            {#if subscriptions.length > 0}
+              <span class="mobile-badge-dot"></span>
+            {/if}
+          </button>
+        </div>
+      </header>
+
+      <div
+        class="mobile-date-bar"
+        on:touchstart|passive={handleMobileTouchStart}
+        on:touchend|passive={handleMobileTouchEnd}
+      >
         <button
           type="button"
-          class="btn btn-secondary"
-          on:click={toggleTheme}
-          title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+          class="mobile-nav-arrow"
+          on:click={() => mobileStepDate(-1)}
+          aria-label="Previous period"
         >
-          {darkMode ? '☀️ Light' : '🌙 Dark'}
+          ‹
+        </button>
+        <div class="mobile-date-title-group">
+          <span class="mobile-date-title">{mobileNavTitle}</span>
+          <span class="mobile-tz-sub">{localTzLabel} &bull; {estTzLabel}</span>
+        </div>
+        <button type="button" class="mobile-today-pill" on:click={mobileGoToday}>
+          Today
         </button>
         <button
           type="button"
-          class="btn btn-secondary"
-          class:btn-notif-active={notificationSettings.enabled && notificationPermission === 'granted'}
-          on:click={openNotificationsModal}
-          title="Configure browser desktop notifications for upcoming events"
+          class="mobile-nav-arrow"
+          on:click={() => mobileStepDate(1)}
+          aria-label="Next period"
         >
-          {notificationSettings.enabled && notificationPermission === 'granted'
-            ? '🔔 Alerts On'
-            : '🔕 Alerts'}
-        </button>
-        <button
-          type="button"
-          class="btn btn-secondary"
-          on:click={openSubscriptionsModal}
-          title="Subscribe to Google Calendar or other .ics feeds"
-        >
-          Calendars{subscriptions.length ? ` (${subscriptions.length + 1})` : ''}
-        </button>
-        <button
-          type="button"
-          class="btn btn-secondary"
-          on:click={triggerIcsImport}
-          disabled={importingIcs}
-          title="Import .ics file into your calendar"
-        >
-          {importingIcs ? 'Importing...' : 'Import .ics'}
-        </button>
-        <button
-          type="button"
-          class="btn btn-secondary"
-          on:click={() => fetchEvents(null, null, { force: true, serverRefresh: true })}
-          disabled={loadingEvents}
-        >
-          Refresh
-        </button>
-        <button
-          type="button"
-          class="btn btn-primary"
-          on:click={() => openCreateModal()}
-        >
-          + New Event
-        </button>
-        <button
-          type="button"
-          class="btn btn-ghost"
-          on:click={handleLogout}
-          title="Lock calendar"
-        >
-          Lock
+          ›
         </button>
       </div>
-    </header>
+    {:else}
+      <header class="header">
+        <div class="header-left">
+          <div
+            class="logo-lockup"
+            aria-label="Thundercal"
+            on:mouseenter={triggerAsciiSurge}
+            role="img"
+          >
+            <img class="logo-mark-img" src="/logo.png" alt="Thundercal logo" />
+            <div class="ascii-wordmark" aria-hidden="true">
+              <pre class="ascii-part ascii-thunder">{asciiThunderText}</pre>
+              <pre class="ascii-part ascii-cal">{asciiCalText}</pre>
+            </div>
+          </div>
+          {#if loadingEvents || importingIcs}
+            <span class="status-pill">
+              {importingIcs ? 'Importing .ics...' : 'Syncing...'}
+            </span>
+          {/if}
+        </div>
+
+        <div class="header-actions">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={toggleTheme}
+            title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {darkMode ? '☀️ Light' : '🌙 Dark'}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary"
+            class:btn-notif-active={notificationSettings.enabled && notificationPermission === 'granted'}
+            on:click={openNotificationsModal}
+            title="Configure browser desktop notifications for upcoming events"
+          >
+            {notificationSettings.enabled && notificationPermission === 'granted'
+              ? '🔔 Alerts On'
+              : '🔕 Alerts'}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={openSubscriptionsModal}
+            title="Subscribe to Google Calendar or other .ics feeds"
+          >
+            Calendars{subscriptions.length ? ` (${subscriptions.length + 1})` : ''}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={triggerIcsImport}
+            disabled={importingIcs}
+            title="Import .ics file into your calendar"
+          >
+            {importingIcs ? 'Importing...' : 'Import .ics'}
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary"
+            on:click={() => fetchEvents(null, null, { force: true, serverRefresh: true })}
+            disabled={loadingEvents}
+          >
+            Refresh
+          </button>
+          <button
+            type="button"
+            class="btn btn-primary"
+            on:click={() => openCreateModal()}
+          >
+            + New Event
+          </button>
+          {#if layoutMode === 'desktop'}
+            <button
+              type="button"
+              class="btn btn-secondary"
+              on:click={() => setLayoutMode('mobile')}
+              title="Switch back to mobile layout"
+            >
+              📱 Mobile
+            </button>
+          {/if}
+          <button
+            type="button"
+            class="btn btn-ghost"
+            on:click={handleLogout}
+            title="Lock calendar"
+          >
+            Lock
+          </button>
+        </div>
+      </header>
+    {/if}
 
     {#if subscriptions.length > 0}
-      <div class="calendar-legend">
+      <div class="calendar-legend" class:calendar-legend-mobile={isMobile}>
         <span class="legend-chip">
           <span class="legend-dot" style="background: #039be5;"></span>
           <span>Thundercal</span>
@@ -2606,12 +3118,340 @@
       </div>
     {/if}
 
+    {#if isMobile && mobileTab === 'agenda'}
+      <section
+        class="mobile-agenda-box"
+        bind:this={mobileAgendaScrollEl}
+        on:touchstart|passive={handleMobileTouchStart}
+        on:touchend|passive={handleMobileTouchEnd}
+        aria-label="Upcoming schedule"
+      >
+        {#each mobileAgendaGroups as group (group.key)}
+          <div class="agenda-day-group" class:agenda-day-today={group.isToday}>
+            <div class="agenda-day-header">
+              <div class="agenda-day-title-wrap">
+                <span class="agenda-weekday">{group.weekdayLabel}</span>
+                <span class="agenda-date-text">{group.dateLabel}</span>
+                {#if group.isToday}
+                  <span class="agenda-today-chip">Today</span>
+                {/if}
+              </div>
+              <button
+                type="button"
+                class="agenda-add-day-btn"
+                on:click={() => openCreateModal(group.date, null, false)}
+                aria-label="Add event on {group.dateLabel}"
+              >
+                + Add
+              </button>
+            </div>
+
+            {#if group.items.length === 0}
+              <div class="agenda-empty-day">
+                <span>No events scheduled</span>
+              </div>
+            {:else}
+              <div class="agenda-events-list">
+                {#each group.items as ev (ev.id + '_' + group.key)}
+                  {@const t = formatAgendaEventTime(ev)}
+                  {@const evColor = ev.extendedProps?.color || ev.color || '#039be5'}
+                  {@const evLoc = ev.extendedProps?.location || ''}
+                  <div
+                    class="agenda-event-card"
+                    role="button"
+                    tabindex="0"
+                    on:click={() => openEventDetails(ev)}
+                    on:keydown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        openEventDetails(ev);
+                      }
+                    }}
+                  >
+                    <span class="agenda-card-stripe" style="background: {evColor};"></span>
+                    <div class="agenda-card-time">
+                      <span class="agenda-time-primary">{t.primary}</span>
+                      {#if t.secondary}
+                        <span class="agenda-time-secondary">{t.secondary}</span>
+                      {/if}
+                    </div>
+                    <div class="agenda-card-main">
+                      <div class="agenda-card-title-row">
+                        <span class="agenda-card-title">{ev.title}</span>
+                        {#if ev.extendedProps?.isRecurring}
+                          <span class="agenda-recurring-icon" title="Recurring">🔁</span>
+                        {/if}
+                      </div>
+                      {#if ev.extendedProps?.calendarName && ev.extendedProps.calendarName !== 'Thundercal'}
+                        <div class="agenda-card-cal">{ev.extendedProps.calendarName}</div>
+                      {/if}
+                      {#if evLoc}
+                        <div class="agenda-card-actions">
+                          {#if isMeetingUrl(evLoc)}
+                            <a
+                              href={evLoc}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="agenda-quick-chip agenda-chip-zoom"
+                              on:click|stopPropagation
+                            >
+                              📹 Join Meeting &nearr;
+                            </a>
+                          {:else if isUrl(evLoc)}
+                            <a
+                              href={evLoc}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="agenda-quick-chip"
+                              on:click|stopPropagation
+                            >
+                              🔗 Open Link &nearr;
+                            </a>
+                          {:else}
+                            <a
+                              href={buildMapQuestUrl(evLoc, ev.extendedProps?.locationUrl)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              class="agenda-quick-chip"
+                              on:click|stopPropagation
+                            >
+                              📍 {evLoc}
+                            </a>
+                          {/if}
+                        </div>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/each}
+      </section>
+    {/if}
+
     <div
       class="calendar-wrapper"
       class:ec-dark={darkMode}
+      class:is-mobile-cal={isMobile}
+      class:mobile-hidden={isMobile && mobileTab === 'agenda'}
+      class:mobile-month-split={isMobile && mobileTab === 'dayGridMonth'}
       bind:this={calendarEl}
     ></div>
+
+    {#if isMobile && mobileTab === 'dayGridMonth'}
+      <section class="mobile-month-tray" aria-label="Events on selected date">
+        <div class="mobile-month-tray-header">
+          <span class="mobile-month-tray-title">
+            {mobileFocusDate.toLocaleDateString('en-US', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric'
+            })}
+          </span>
+          <button
+            type="button"
+            class="agenda-add-day-btn"
+            on:click={() => openCreateModal(mobileFocusDate, null, false)}
+          >
+            + Add Event
+          </button>
+        </div>
+        {#if mobileSelectedDayEvents.length === 0}
+          <div class="mobile-month-tray-empty">No events on this day.</div>
+        {:else}
+          <div class="mobile-month-tray-list">
+            {#each mobileSelectedDayEvents as ev (ev.id)}
+              {@const t = formatAgendaEventTime(ev)}
+              {@const evColor = ev.extendedProps?.color || ev.color || '#039be5'}
+              <button
+                type="button"
+                class="mobile-tray-item"
+                on:click={() => openEventDetails(ev)}
+              >
+                <span class="legend-dot" style="background: {evColor};"></span>
+                <span class="mobile-tray-item-time">{t.primary}</span>
+                <span class="mobile-tray-item-title">{ev.title}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </section>
+    {/if}
+
+    {#if isMobile}
+      <nav class="mobile-bottom-bar" aria-label="Calendar views and actions">
+        <button
+          type="button"
+          class="mobile-tab-btn"
+          class:mobile-tab-active={mobileTab === 'agenda'}
+          on:click={() => switchMobileTab('agenda')}
+        >
+          <span class="mobile-tab-icon">☰</span>
+          <span class="mobile-tab-label">Agenda</span>
+        </button>
+        <button
+          type="button"
+          class="mobile-tab-btn"
+          class:mobile-tab-active={mobileTab === 'timeGridDay'}
+          on:click={() => switchMobileTab('timeGridDay')}
+        >
+          <span class="mobile-tab-icon">▣</span>
+          <span class="mobile-tab-label">Day</span>
+        </button>
+        <button
+          type="button"
+          class="mobile-fab-add"
+          on:click={() => openCreateModal(mobileFocusDate)}
+          aria-label="Create new event"
+        >
+          +
+        </button>
+        <button
+          type="button"
+          class="mobile-tab-btn"
+          class:mobile-tab-active={mobileTab === 'timeGridThreeDay'}
+          on:click={() => switchMobileTab('timeGridThreeDay')}
+        >
+          <span class="mobile-tab-icon">◫</span>
+          <span class="mobile-tab-label">3-Day</span>
+        </button>
+        <button
+          type="button"
+          class="mobile-tab-btn"
+          class:mobile-tab-active={mobileTab === 'dayGridMonth'}
+          on:click={() => switchMobileTab('dayGridMonth')}
+        >
+          <span class="mobile-tab-icon">▦</span>
+          <span class="mobile-tab-label">Month</span>
+        </button>
+      </nav>
+    {/if}
   </main>
+
+  {#if showMobileMenu}
+    <div
+      class="modal-backdrop"
+      on:click|self={() => (showMobileMenu = false)}
+      role="presentation"
+    >
+      <div class="modal mobile-menu-sheet" role="dialog" aria-modal="true" aria-label="Menu">
+        <div class="mobile-sheet-handle" aria-hidden="true"></div>
+        <div class="modal-header">
+          <div>
+            <h2>Thundercal Menu</h2>
+            <div class="detail-calendar-badge">
+              <span>v{appVersion} &bull; Firefox &amp; iOS Mobile Edition</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="close-btn"
+            on:click={() => (showMobileMenu = false)}
+            aria-label="Close menu"
+          >
+            &times;
+          </button>
+        </div>
+
+        <div class="mobile-menu-list">
+          <button
+            type="button"
+            class="mobile-menu-item"
+            on:click={() => {
+              showMobileMenu = false;
+              openSubscriptionsModal();
+            }}
+          >
+            <span class="mobile-menu-item-left">
+              <span class="mobile-menu-emoji">📅</span>
+              <span>
+                <strong>Calendars &amp; Feeds</strong>
+                <small>{subscriptions.length + 1} connected</small>
+              </span>
+            </span>
+            <span class="mobile-menu-chevron">›</span>
+          </button>
+
+          <button
+            type="button"
+            class="mobile-menu-item"
+            disabled={importingIcs}
+            on:click={() => {
+              showMobileMenu = false;
+              triggerIcsImport();
+            }}
+          >
+            <span class="mobile-menu-item-left">
+              <span class="mobile-menu-emoji">📥</span>
+              <span>
+                <strong>{importingIcs ? 'Importing .ics...' : 'Import .ics File'}</strong>
+                <small>Add calendar events from an .ics file</small>
+              </span>
+            </span>
+            <span class="mobile-menu-chevron">›</span>
+          </button>
+
+          <button
+            type="button"
+            class="mobile-menu-item"
+            on:click={() => {
+              showMobileMenu = false;
+              openNotificationsModal();
+            }}
+          >
+            <span class="mobile-menu-item-left">
+              <span class="mobile-menu-emoji">
+                {notificationSettings.enabled && notificationPermission === 'granted' ? '🔔' : '🔕'}
+              </span>
+              <span>
+                <strong>Event Alerts</strong>
+                <small>
+                  {notificationSettings.enabled && notificationPermission === 'granted'
+                    ? `Active (${notificationSettings.leadMinutes}m before)`
+                    : 'Configure browser reminders'}
+                </small>
+              </span>
+            </span>
+            <span class="mobile-menu-chevron">›</span>
+          </button>
+
+          <button
+            type="button"
+            class="mobile-menu-item"
+            on:click={() => setLayoutMode('desktop')}
+          >
+            <span class="mobile-menu-item-left">
+              <span class="mobile-menu-emoji">🖥️</span>
+              <span>
+                <strong>Switch to Desktop Layout</strong>
+                <small>View full 7-day desktop grid</small>
+              </span>
+            </span>
+            <span class="mobile-menu-chevron">›</span>
+          </button>
+
+          <button
+            type="button"
+            class="mobile-menu-item mobile-menu-item-danger"
+            on:click={() => {
+              showMobileMenu = false;
+              handleLogout();
+            }}
+          >
+            <span class="mobile-menu-item-left">
+              <span class="mobile-menu-emoji">🔒</span>
+              <span>
+                <strong>Lock Calendar</strong>
+                <small>Sign out of this session</small>
+              </span>
+            </span>
+            <span class="mobile-menu-chevron">›</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   {#if showSubscriptionsModal}
     <div class="modal-backdrop" on:click|self={closeSubscriptionsModal} role="presentation">
@@ -3594,11 +4434,24 @@
   {/if}
 {/if}
 
-<div class="version-corner" aria-label="Application version">
-  v{appVersion}
+{#if !isMobile || !authenticated}
+  <div class="version-corner" aria-label="Application version">
+    v{appVersion}
+  </div>
+{/if}
 </div>
 
 <style>
+  .app-root {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .mobile-hidden {
+    display: none !important;
+  }
   .sr-only-input {
     display: none;
   }
@@ -4575,5 +5428,692 @@
     opacity: 0.75;
     pointer-events: none;
     z-index: 50;
+  }
+
+  /* --- iPhone 17 Pro & Firefox iOS Mobile Layout --- */
+  .auth-screen-mobile {
+    min-height: 100dvh;
+    padding: calc(1.25rem + env(safe-area-inset-top, 0px)) 1rem
+      calc(1.25rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .auth-screen-mobile .auth-card {
+    padding: 1.5rem 1.25rem;
+    border-radius: 1rem;
+  }
+
+  .auth-screen-mobile .logo-lockup-auth .logo-mark-img {
+    height: 2.35rem;
+    width: 2.35rem;
+  }
+
+  .auth-screen-mobile .logo-lockup-auth .ascii-part {
+    font-size: 0.31rem;
+    letter-spacing: 0;
+  }
+
+  .container.container-mobile {
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100dvh;
+    padding: calc(0.45rem + env(safe-area-inset-top, 0px)) 0.65rem 0;
+    gap: 0.45rem;
+  }
+
+  .mobile-topbar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.4rem;
+    padding: 0.15rem 0.1rem;
+  }
+
+  .logo-lockup-mobile {
+    gap: 0.45rem;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .logo-lockup-mobile .logo-mark-img {
+    height: 2rem;
+    width: 2rem;
+  }
+
+  .ascii-wordmark-mobile {
+    overflow: hidden;
+  }
+
+  .ascii-wordmark-mobile .ascii-part {
+    font-size: 0.315rem;
+    line-height: 1.04;
+    letter-spacing: 0;
+  }
+
+  .mobile-sync-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 999px;
+    background: #3b82f6;
+    flex-shrink: 0;
+    animation: mobile-pulse 1.1s ease-in-out infinite;
+  }
+
+  @keyframes mobile-pulse {
+    0%,
+    100% {
+      opacity: 0.35;
+      transform: scale(0.88);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1.15);
+    }
+  }
+
+  @keyframes mobile-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .mobile-topbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+
+  .mobile-icon-btn {
+    position: relative;
+    width: 2.35rem;
+    height: 2.35rem;
+    border-radius: 0.65rem;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-size: 1.05rem;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: var(--shadow-card);
+  }
+
+  .mobile-icon-btn:active {
+    background: var(--bg-subtle);
+  }
+
+  .mobile-icon-btn.is-spinning {
+    animation: mobile-spin 0.9s linear infinite;
+  }
+
+  .mobile-badge-dot {
+    position: absolute;
+    top: 0.32rem;
+    right: 0.32rem;
+    width: 0.42rem;
+    height: 0.42rem;
+    border-radius: 999px;
+    background: #3b82f6;
+  }
+
+  .mobile-date-bar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.75rem;
+    padding: 0.32rem 0.4rem;
+    box-shadow: var(--shadow-card);
+    user-select: none;
+  }
+
+  .mobile-nav-arrow {
+    width: 2.15rem;
+    height: 2.15rem;
+    border-radius: 0.55rem;
+    border: none;
+    background: var(--bg-subtle);
+    color: var(--text-primary);
+    font-size: 1.35rem;
+    font-weight: 600;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .mobile-nav-arrow:active {
+    opacity: 0.75;
+  }
+
+  .mobile-date-title-group {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 0 0.25rem;
+  }
+
+  .mobile-date-title {
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.2;
+  }
+
+  .mobile-tz-sub {
+    font-size: 0.66rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 0.03em;
+    line-height: 1.15;
+  }
+
+  .mobile-today-pill {
+    border: 1px solid var(--border-color);
+    background: var(--bg-page);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.35rem 0.65rem;
+    border-radius: 999px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .calendar-legend-mobile {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding-bottom: 0.1rem;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .calendar-legend-mobile::-webkit-scrollbar {
+    display: none;
+  }
+
+  .calendar-legend-mobile .legend-chip {
+    flex-shrink: 0;
+    font-size: 0.74rem;
+    padding: 0.2rem 0.55rem;
+  }
+
+  .container-mobile .calendar-wrapper {
+    padding: 0.45rem 0.35rem;
+    border-radius: 0.75rem;
+  }
+
+  .container-mobile .calendar-wrapper.mobile-month-split {
+    flex: 1.15 1 0%;
+  }
+
+  /* Mobile Agenda Schedule List */
+  .mobile-agenda-box {
+    flex: 1 1 0%;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.75rem;
+    box-shadow: var(--shadow-card);
+    padding: 0.35rem 0.55rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+  }
+
+  .agenda-day-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.38rem;
+  }
+
+  .agenda-day-header {
+    position: sticky;
+    top: -0.35rem;
+    z-index: 5;
+    background: var(--bg-surface);
+    padding: 0.42rem 0.2rem 0.28rem;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .agenda-day-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .agenda-weekday {
+    font-size: 0.82rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-primary);
+  }
+
+  .agenda-day-today .agenda-weekday {
+    color: #2563eb;
+  }
+
+  .agenda-date-text {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+
+  .agenda-today-chip {
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.08rem 0.42rem;
+    border-radius: 999px;
+    background: rgba(37, 99, 235, 0.14);
+    color: #3b82f6;
+  }
+
+  .agenda-add-day-btn {
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-page);
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+
+  .agenda-empty-day {
+    padding: 0.6rem 0.5rem;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    background: var(--bg-page);
+    border-radius: 0.55rem;
+    border: 1px dashed var(--border-subtle);
+    text-align: center;
+  }
+
+  .agenda-events-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.42rem;
+  }
+
+  .agenda-event-card {
+    display: flex;
+    align-items: stretch;
+    gap: 0.6rem;
+    padding: 0.58rem 0.65rem 0.58rem 0.5rem;
+    background: var(--bg-page);
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.65rem;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .agenda-event-card:active {
+    background: var(--bg-subtle);
+  }
+
+  .agenda-card-stripe {
+    width: 4px;
+    border-radius: 999px;
+    flex-shrink: 0;
+  }
+
+  .agenda-card-time {
+    width: 5.4rem;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.1rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .agenda-time-primary {
+    font-size: 0.76rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1.2;
+  }
+
+  .agenda-time-secondary {
+    font-size: 0.66rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    line-height: 1.15;
+  }
+
+  .agenda-card-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.22rem;
+  }
+
+  .agenda-card-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .agenda-card-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.25;
+    word-break: break-word;
+  }
+
+  .agenda-recurring-icon {
+    font-size: 0.75rem;
+    flex-shrink: 0;
+  }
+
+  .agenda-card-cal {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+  }
+
+  .agenda-card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.1rem;
+  }
+
+  .agenda-quick-chip {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.18rem 0.5rem;
+    border-radius: 999px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    color: var(--link-color);
+    text-decoration: none;
+  }
+
+  .agenda-chip-zoom {
+    background: rgba(37, 99, 235, 0.12);
+    border-color: rgba(59, 130, 246, 0.35);
+  }
+
+  /* Selected-day tray under Mobile Month Grid */
+  .mobile-month-tray {
+    flex: 0.75 1 0%;
+    min-height: 7.5rem;
+    max-height: 34dvh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.75rem;
+    padding: 0.5rem 0.65rem;
+    box-shadow: var(--shadow-card);
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .mobile-month-tray-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .mobile-month-tray-title {
+    font-size: 0.84rem;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .mobile-month-tray-empty {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    padding: 0.45rem 0.1rem;
+  }
+
+  .mobile-month-tray-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.32rem;
+  }
+
+  .mobile-tray-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.45rem 0.55rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-page);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .mobile-tray-item-time {
+    font-size: 0.74rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .mobile-tray-item-title {
+    font-size: 0.84rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Bottom Thumb Tab Bar (iPhone Safe Area Ready) */
+  .mobile-bottom-bar {
+    flex-shrink: 0;
+    display: grid;
+    grid-template-columns: 1fr 1fr auto 1fr 1fr;
+    align-items: center;
+    gap: 0.25rem;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border-subtle);
+    margin: 0 -0.65rem;
+    padding: 0.38rem 0.65rem calc(0.42rem + env(safe-area-inset-bottom, 0px));
+    box-shadow: 0 -2px 10px rgba(15, 23, 42, 0.06);
+  }
+
+  .mobile-tab-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    padding: 0.28rem 0.2rem;
+    border-radius: 0.6rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.12rem;
+    cursor: pointer;
+  }
+
+  .mobile-tab-active {
+    color: #3b82f6;
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  .mobile-tab-icon {
+    font-size: 1rem;
+    line-height: 1;
+  }
+
+  .mobile-tab-label {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    line-height: 1.1;
+  }
+
+  .mobile-fab-add {
+    width: 2.85rem;
+    height: 2.85rem;
+    margin: -0.55rem 0.35rem 0;
+    border-radius: 999px;
+    border: none;
+    background: linear-gradient(135deg, #2563eb, #4f46e5);
+    color: #ffffff;
+    font-size: 1.65rem;
+    font-weight: 500;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 6px 16px rgba(37, 99, 235, 0.4);
+    cursor: pointer;
+  }
+
+  .mobile-fab-add:active {
+    transform: scale(0.95);
+  }
+
+  /* Mobile Menu Sheet & Bottom-Sheet Modals (Firefox iOS 16px input no-zoom) */
+  .mobile-sheet-handle {
+    width: 2.5rem;
+    height: 0.28rem;
+    border-radius: 999px;
+    background: var(--border-color);
+    margin: -0.35rem auto 0.1rem;
+    flex-shrink: 0;
+  }
+
+  .mobile-menu-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  .mobile-menu-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.78rem 0.85rem;
+    border-radius: 0.7rem;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-page);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .mobile-menu-item:active {
+    background: var(--bg-subtle);
+  }
+
+  .mobile-menu-item-left {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-width: 0;
+  }
+
+  .mobile-menu-emoji {
+    font-size: 1.2rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  .mobile-menu-item-left span:last-child {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+  }
+
+  .mobile-menu-item-left strong {
+    font-size: 0.92rem;
+    font-weight: 600;
+  }
+
+  .mobile-menu-item-left small {
+    font-size: 0.76rem;
+    color: var(--text-muted);
+  }
+
+  .mobile-menu-chevron {
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .mobile-menu-item-danger strong {
+    color: #ef4444;
+  }
+
+  .is-mobile .modal-backdrop {
+    align-items: flex-end;
+    padding: 0;
+  }
+
+  .is-mobile .modal {
+    max-width: 100%;
+    max-height: 92dvh;
+    border-radius: 1.15rem 1.15rem 0 0;
+    border-bottom: none;
+    padding: 1.15rem 1.1rem calc(1.15rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .is-mobile .field-row {
+    flex-direction: column;
+    gap: 0.8rem;
+  }
+
+  /* 16px font-size prevents WebKit / Firefox on iOS from auto-zooming on input focus */
+  .is-mobile .field input,
+  .is-mobile .field textarea,
+  .is-mobile .select-input,
+  .is-mobile .publish-url-input {
+    font-size: 16px;
+    min-height: 2.75rem;
+  }
+
+  .is-mobile .btn {
+    min-height: 2.65rem;
+  }
+
+  .is-mobile .modal-actions {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .is-mobile .sub-item-meta {
+    max-width: 210px;
   }
 </style>

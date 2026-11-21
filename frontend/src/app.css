@@ -24,6 +24,7 @@
   color-scheme: light;
   color: var(--text-primary);
   background-color: var(--bg-page);
+  -webkit-text-size-adjust: 100%;
 }
 
 html.dark {
@@ -51,18 +52,22 @@ html.dark {
 
 * {
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
+  min-height: 100dvh;
   background-color: var(--bg-page);
   color: var(--text-primary);
+  overscroll-behavior-y: none;
   transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 #app {
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
 }
@@ -79,11 +84,43 @@ body {
   flex: 1 1 0%;
   min-height: 0;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Hide internal toolbar when custom mobile navigation bar is active */
+.calendar-wrapper.is-mobile-cal > .ec > .ec-toolbar {
+  display: none;
+}
+
+.calendar-wrapper.is-mobile-cal .ec-header .ec-day {
+  font-size: 0.76rem;
+  font-weight: 600;
+  padding: 2px 1px;
+}
+
+.calendar-wrapper.is-mobile-cal .ec-event {
+  border-radius: 5px;
+  padding: 2px 4px;
+  font-size: 0.76rem;
+  line-height: 1.25;
+}
+
+.calendar-wrapper.is-mobile-cal .ec-day-grid .ec-body .ec-day {
+  min-height: 3.35rem;
+}
+
+.calendar-wrapper.is-mobile-cal .ec-day-grid .ec-day.ec-highlight {
+  background-color: rgba(59, 130, 246, 0.14);
+  box-shadow: inset 0 0 0 1.5px #3b82f6;
 }
 
 /* Dual Timezone Bar (EST on left, PST / Local on right) in @event-calendar/time-grid */
 .ec-time-grid .ec-sidebar {
   padding: 0 6px;
+}
+
+.calendar-wrapper.is-mobile-cal .ec-time-grid .ec-sidebar {
+  padding: 0 3px;
 }
 
 .ec-time-grid .ec-header .ec-sidebar-title {
@@ -107,6 +144,11 @@ body {
   font-size: 0.75rem;
   color: var(--text-muted);
   text-align: center;
+}
+
+.calendar-wrapper.is-mobile-cal .ec-time-grid .ec-all-day .ec-sidebar-title {
+  font-size: 0.65rem;
+  padding: 4px 0;
 }
 
 .tz-dual-slot {
@@ -140,4 +182,50 @@ body {
   color: var(--text-primary);
   font-weight: 600;
   border-left: 1px solid var(--border-subtle);
+}
+
+/* Compact stacked dual-timezone gutter for iPhone mobile time-grid */
+.tz-mobile-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  width: 40px;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+  transform: translateY(-2px);
+}
+
+.tz-mobile-slot .tz-m-local {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.tz-mobile-slot .tz-m-est {
+  font-size: 0.56rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.tz-mobile-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  width: 40px;
+  font-size: 0.58rem;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+
+.tz-mobile-header .tz-m-est {
+  font-size: 0.52rem;
+  font-weight: 600;
+  color: var(--text-muted);
 }
