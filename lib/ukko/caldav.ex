@@ -1,9 +1,8 @@
 defmodule Ukko.CalDAV do
   @moduledoc """
-  Thundermail CalDAV client using `Req` and `SweetXml`.
+  Thundermail CalDAV client using `Req`.
   """
 
-  import SweetXml
   alias Ukko.{FastCache, ICal}
 
   @caldav_soft_ttl_seconds 45
@@ -64,13 +63,9 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
-          parsed_calendars =
-            body
-            |> to_string()
-            |> FastCache.extract_xml_tag_bodies("calendar-data")
-            |> Enum.reject(fn ics -> String.trim(ics) == "" end)
-            |> Enum.map(&ICal.parse_calendar_data/1)
-            |> Enum.reject(fn {_vtz, raw_vevents, _overrides} -> raw_vevents == [] end)
+          combined_ics = build_combined_ics(to_string(body))
+          {_vtz, raw_vevents, _overrides} = parsed_cal = ICal.parse_calendar_data(combined_ics)
+          parsed_calendars = if raw_vevents == [], do: [], else: [parsed_cal]
 
           {:ok, parsed_calendars}
 
@@ -113,9 +108,21 @@ defmodule Ukko.CalDAV do
   def put_raw_ics_to_url(resource_url, ics_payload)
       when is_binary(resource_url) and is_binary(ics_payload) do
     with {:ok, cfg} <- get_config() do
+      is_internal_config = String.contains?(resource_url, "ukko-subscriptions-config")
+
+      put_headers =
+        if is_internal_config do
+          [{"content-type", "text/calendar; charset=utf-8"}]
+        else
+          [
+            {"content-type", "text/calendar; charset=utf-8"},
+            {"schedule-reply", "T"}
+          ]
+        end
+
       case Req.put(resource_url,
              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-             headers: [{"content-type", "text/calendar; charset=utf-8"}],
+             headers: put_headers,
              body: ics_payload,
              decode_body: false,
              receive_timeout: 30_000,
@@ -124,7 +131,7 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 201, 204] ->
-          unless String.contains?(resource_url, "ukko-subscriptions-config") do
+          unless is_internal_config do
             FastCache.invalidate_caldav()
           end
 
@@ -139,6 +146,31 @@ defmodule Ukko.CalDAV do
     end
   rescue
     e -> {:error, {:exception, Exception.message(e)}}
+  end
+
+  @doc """
+  Deletes any duplicate CalDAV resource URLs left behind under alternate filenames.
+  """
+  def delete_resource_urls(urls) when is_list(urls) do
+    if urls != [] do
+      with {:ok, cfg} <- get_config() do
+        Enum.each(urls, fn url ->
+          _ =
+            Req.delete(url,
+              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+              headers: [{"schedule-reply", "F"}],
+              decode_body: false,
+              receive_timeout: 15_000
+            )
+        end)
+
+        FastCache.invalidate_caldav()
+      end
+    end
+
+    :ok
+  rescue
+    _ -> :ok
   end
 
   @doc """
@@ -169,10 +201,26 @@ defmodule Ukko.CalDAV do
              max_retries: 1
            ) do
         {:ok, %Req.Response{status: 200, body: body}} ->
-          {:ok, %{url: event_url, ics: to_string(body)}}
+          other_urls =
+            if uid == "ukko-subscriptions-config" do
+              []
+            else
+              cfg
+              |> lookup_all_event_resources_by_uid(uid)
+              |> Enum.map(& &1.url)
+              |> Enum.reject(&(&1 == event_url))
+            end
+
+          {:ok, %{url: event_url, ics: to_string(body), duplicate_urls: other_urls}}
 
         {:ok, %Req.Response{status: 404}} ->
-          lookup_event_resource_by_uid(cfg, uid)
+          case lookup_all_event_resources_by_uid(cfg, uid) do
+            [primary | rest] ->
+              {:ok, %{url: primary.url, ics: primary.ics, duplicate_urls: Enum.map(rest, & &1.url)}}
+
+            [] ->
+              {:error, :not_found}
+          end
 
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {:caldav_error, status, body}}
@@ -252,53 +300,54 @@ defmodule Ukko.CalDAV do
       event_url = build_event_url(cfg.url, uid)
       sched_headers = [{"schedule-reply", "T"}]
 
-      case Req.delete(event_url,
-             auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-             headers: sched_headers,
-             decode_body: false,
-             receive_timeout: 25_000,
-             connect_options: [timeout: 15_000],
-             retry: :transient,
-             max_retries: 2
-           ) do
-        {:ok, %Req.Response{status: status}} when status in [200, 202, 204] ->
-          FastCache.invalidate_caldav()
-          :ok
+      # Discover all CalDAV resource URLs carrying this UID (handles server-named or imported .ics files)
+      discovered_urls =
+        cfg
+        |> lookup_all_event_resources_by_uid(uid)
+        |> Enum.map(& &1.url)
 
-        {:ok, %Req.Response{status: 404}} ->
-          case lookup_event_resource_by_uid(cfg, uid) do
-            {:ok, %{url: resolved_url}} ->
-              _ =
-                Req.delete(resolved_url,
-                  auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-                  headers: sched_headers,
-                  decode_body: false
-                )
+      alt_urls =
+        if String.contains?(uid, "@") do
+          [build_event_url(cfg.url, String.replace(uid, "@", "_"))]
+        else
+          []
+        end
 
-              FastCache.invalidate_caldav()
-              :ok
+      candidate_urls = Enum.uniq([event_url | discovered_urls ++ alt_urls])
 
-            _ ->
-              if String.contains?(uid, "@") do
-                alt_url = build_event_url(cfg.url, String.replace(uid, "@", "_"))
+      results =
+        Enum.map(candidate_urls, fn target_url ->
+          Req.delete(target_url,
+            auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+            headers: sched_headers,
+            decode_body: false,
+            receive_timeout: 25_000,
+            connect_options: [timeout: 15_000],
+            retry: :transient,
+            max_retries: 2
+          )
+        end)
 
-                _ =
-                  Req.delete(alt_url,
-                    auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-                    headers: sched_headers,
-                    decode_body: false
-                  )
-              end
+      FastCache.invalidate_caldav()
 
-              FastCache.invalidate_caldav()
-              :ok
-          end
+      hard_error =
+        Enum.find_value(results, fn
+          {:ok, %Req.Response{status: status}} when status in [200, 202, 204, 404] -> nil
+          {:ok, %Req.Response{status: status, body: body}} -> {:caldav_error, status, body}
+          {:error, exception} -> exception
+        end)
 
-        {:ok, %Req.Response{status: status, body: body}} ->
-          {:error, {:caldav_error, status, body}}
+      if is_nil(hard_error) do
+        :ok
+      else
+        # If at least one resource succeeded (200/202/204), treat overall delete as successful
+        any_deleted? =
+          Enum.any?(results, fn
+            {:ok, %Req.Response{status: status}} when status in [200, 202, 204] -> true
+            _ -> false
+          end)
 
-        {:error, exception} ->
-          {:error, exception}
+        if any_deleted?, do: :ok, else: {:error, hard_error}
       end
     end
   rescue
@@ -344,7 +393,8 @@ defmodule Ukko.CalDAV do
 
   @doc """
   Combines all `<calendar-data>` blocks from a CalDAV `<multistatus>` XML response into a
-  single RFC 5545 `VCALENDAR` document.
+  single RFC 5545 `VCALENDAR` document with normalized CRLF line endings, deduplicated
+  `(UID, RECURRENCE-ID)` entries (keeping the highest revision), and refresh hints.
   """
   def build_combined_ics(xml_body) when is_binary(xml_body) do
     ics_blobs = FastCache.extract_xml_tag_bodies(xml_body, "calendar-data")
@@ -352,13 +402,17 @@ defmodule Ukko.CalDAV do
     vtimezones =
       ics_blobs
       |> Enum.flat_map(fn ics ->
-        ~r/BEGIN:VTIMEZONE\r?\n.*?END:VTIMEZONE/s
-        |> Regex.scan(ics)
+        normalized = normalize_crlf(ics)
+
+        ~r/BEGIN:VTIMEZONE\r\n.*?END:VTIMEZONE/s
+        |> Regex.scan(normalized)
         |> Enum.map(fn [block] -> String.trim(block) end)
       end)
       |> Enum.uniq_by(fn vt_block ->
-        case Regex.run(~r/^TZID(?:;[^:]*)?:(.*)$/m, vt_block, capture: :all_but_first) do
-          [tzid] -> String.trim(tzid)
+        unfolded_vt = String.replace(vt_block, ~r/\r\n[ \t]/, "")
+
+        case Regex.run(~r/^TZID(?:;[^:]*)?:(.*)$/m, unfolded_vt, capture: :all_but_first) do
+          [tzid] -> String.upcase(String.trim(tzid, " \""))
           _ -> vt_block
         end
       end)
@@ -366,32 +420,113 @@ defmodule Ukko.CalDAV do
     vevents =
       ics_blobs
       |> Enum.flat_map(fn ics ->
-        ~r/BEGIN:VEVENT\r?\n.*?END:VEVENT/s
-        |> Regex.scan(ics)
+        normalized = normalize_crlf(ics)
+
+        ~r/BEGIN:VEVENT\r\n.*?END:VEVENT/s
+        |> Regex.scan(normalized)
         |> Enum.map(fn [block] -> String.trim(block) end)
       end)
-      |> Enum.reject(fn vevent_block ->
-        String.contains?(vevent_block, "UID:ukko-subscriptions-config")
-      end)
+      |> Enum.map(&inspect_vevent_for_feed/1)
+      |> Enum.reject(&is_nil/1)
+      |> deduplicate_feed_vevents()
 
     lines =
       [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//Ukko Cal//CalDAV Feed//EN",
+        "PRODID:-//Thundercal//CalDAV Feed//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:Ukko Calendar",
-        "X-WR-TIMEZONE:America/Los_Angeles"
+        "X-WR-CALNAME:Thundercal",
+        "X-WR-TIMEZONE:America/Los_Angeles",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT15M",
+        "X-PUBLISHED-TTL:PT15M"
       ] ++ vtimezones ++ vevents ++ ["END:VCALENDAR", ""]
 
     Enum.join(lines, "\r\n")
   rescue
     _ ->
-      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Ukko Cal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Thundercal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
   catch
     :exit, _ ->
-      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Ukko Cal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Thundercal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+  end
+
+  defp normalize_crlf(str) when is_binary(str) do
+    str
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+    |> String.replace("\n", "\r\n")
+  end
+
+  defp inspect_vevent_for_feed(vevent_block) do
+    unfolded = String.replace(vevent_block, ~r/\r\n[ \t]/, "")
+
+    uid = extract_simple_ical_prop(unfolded, "UID")
+    status = String.upcase(extract_simple_ical_prop(unfolded, "STATUS") || "")
+    rec_id = extract_simple_ical_prop(unfolded, "RECURRENCE-ID")
+
+    cond do
+      is_nil(uid) or uid == "" or uid == "ukko-subscriptions-config" ->
+        nil
+
+      # Omit standalone cancelled events from METHOD:PUBLISH so subscribed calendars remove them
+      status == "CANCELLED" and is_nil(rec_id) ->
+        nil
+
+      true ->
+        seq =
+          case Integer.parse(extract_simple_ical_prop(unfolded, "SEQUENCE") || "0") do
+            {n, _} -> n
+            :error -> 0
+          end
+
+        stamp =
+          extract_simple_ical_prop(unfolded, "LAST-MODIFIED") ||
+            extract_simple_ical_prop(unfolded, "DTSTAMP") ||
+            ""
+
+        has_rrule = not is_nil(extract_simple_ical_prop(unfolded, "RRULE"))
+
+        %{
+          key: {uid, rec_id || ""},
+          rank: {seq, stamp},
+          is_master: is_nil(rec_id) and has_rrule,
+          block: vevent_block
+        }
+    end
+  end
+
+  defp deduplicate_feed_vevents(entries) do
+    best_by_key =
+      Enum.reduce(entries, %{}, fn entry, acc ->
+        case Map.get(acc, entry.key) do
+          nil ->
+            Map.put(acc, entry.key, entry)
+
+          existing ->
+            if entry.rank >= existing.rank do
+              Map.put(acc, entry.key, entry)
+            else
+              acc
+            end
+        end
+      end)
+
+    # Emit master VEVENTs before RECURRENCE-ID overrides (required by Google & Apple Calendar)
+    best_by_key
+    |> Map.values()
+    |> Enum.sort_by(fn entry -> {elem(entry.key, 0), if(entry.is_master, do: 0, else: 1), elem(entry.key, 1)} end)
+    |> Enum.map(& &1.block)
+  end
+
+  defp extract_simple_ical_prop(unfolded_block, prop_name) do
+    {:ok, re} = Regex.compile("^#{Regex.escape(prop_name)}(?:;[^:]*)?:(.*)$", "im")
+
+    case Regex.run(re, unfolded_block, capture: :all_but_first) do
+      [val] -> String.trim(val)
+      _ -> nil
+    end
   end
 
   @doc """
@@ -467,11 +602,12 @@ defmodule Ukko.CalDAV do
       uid
       |> String.trim_trailing(".ics")
       |> String.replace("@caldav-import", "_caldav-import")
+      |> String.replace("/", "_")
 
     "#{normalized_base}#{URI.encode(clean_uid)}.ics"
   end
 
-  defp lookup_event_resource_by_uid(cfg, uid) do
+  defp lookup_all_event_resources_by_uid(cfg, uid) do
     escaped_uid =
       uid
       |> String.replace("&", "&amp;")
@@ -479,7 +615,7 @@ defmodule Ukko.CalDAV do
       |> String.replace(">", "&gt;")
       |> String.replace("\"", "&quot;")
 
-    xml_body = """
+    prop_filter_xml = """
     <?xml version="1.0" encoding="utf-8" ?>
     <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
       <D:prop>
@@ -498,6 +634,20 @@ defmodule Ukko.CalDAV do
     </C:calendar-query>
     """
 
+    case query_matching_resources_xml(cfg, prop_filter_xml, uid) do
+      [_ | _] = matches ->
+        matches
+
+      [] ->
+        # Fallback full REPORT scan in case the CalDAV server ignores prop-filter collation
+        full_scan_xml = build_report_xml(nil, nil)
+        query_matching_resources_xml(cfg, full_scan_xml, uid)
+    end
+  rescue
+    _ -> []
+  end
+
+  defp query_matching_resources_xml(cfg, xml_body, target_uid) do
     case Req.request(
            method: "REPORT",
            url: cfg.url,
@@ -512,33 +662,53 @@ defmodule Ukko.CalDAV do
            connect_options: [timeout: 10_000]
          ) do
       {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
-        responses = xpath(to_string(body), ~x"//*[local-name()='response']"l)
+        extract_uid_resources_from_multistatus(to_string(body), cfg.url, target_uid)
 
-        found =
-          Enum.find_value(responses, fn resp ->
-            href = resp |> xpath(~x"./*[local-name()='href']/text()"s) |> String.trim()
-            ics = resp |> xpath(~x".//*[local-name()='calendar-data']/text()"ls) |> Enum.join("")
-
-            if href != "" and String.trim(ics) != "" do
-              resolved = URI.merge(URI.parse(cfg.url), href) |> URI.to_string()
-              %{url: resolved, ics: ics}
-            else
-              nil
-            end
-          end)
-
-        if found, do: {:ok, found}, else: {:error, :not_found}
-
-      {:ok, %Req.Response{status: status, body: body}} ->
-        {:error, {:caldav_error, status, body}}
-
-      {:error, exception} ->
-        {:error, exception}
+      _ ->
+        []
     end
-  rescue
-    _ -> {:error, :not_found}
-  catch
-    :exit, _ -> {:error, :not_found}
+  end
+
+  @doc """
+  Extracts `{url, ics}` maps matching `target_uid` from a CalDAV `<multistatus>` XML string
+  using pure UTF-8 binary parsing (avoiding `:xmerl` crashes on emojis or non-ASCII characters).
+  """
+  def extract_uid_resources_from_multistatus(xml_str, base_url, target_uid)
+      when is_binary(xml_str) and is_binary(base_url) and is_binary(target_uid) do
+    xml_str
+    |> FastCache.extract_xml_tag_bodies("response")
+    |> Enum.flat_map(fn resp_inner ->
+      href =
+        resp_inner
+        |> FastCache.extract_xml_tag_bodies("href")
+        |> List.first()
+        |> to_string()
+        |> String.trim()
+
+      ics =
+        resp_inner
+        |> FastCache.extract_xml_tag_bodies("calendar-data")
+        |> Enum.join("")
+
+      if href != "" and String.trim(ics) != "" and ics_contains_uid?(ics, target_uid) do
+        resolved = URI.merge(URI.parse(base_url), href) |> URI.to_string()
+        [%{url: resolved, ics: ics}]
+      else
+        []
+      end
+    end)
+    |> Enum.uniq_by(& &1.url)
+  end
+
+  defp ics_contains_uid?(ics_text, target_uid) do
+    unfolded =
+      ics_text
+      |> normalize_crlf()
+      |> String.replace(~r/\r\n[ \t]/, "")
+
+    ~r/^UID(?:;[^:]*)?:(.*)$/im
+    |> Regex.scan(unfolded, capture: :all_but_first)
+    |> Enum.any?(fn [val] -> String.trim(val) == target_uid end)
   end
 
   defp get_config do

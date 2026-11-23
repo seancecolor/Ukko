@@ -317,17 +317,24 @@ defmodule UkkoWeb.EventController do
   defp persist_event_save(uid, enriched_attrs, true, edit_scope, recurrence_id)
        when edit_scope in ["single", "following"] do
     case CalDAV.get_event_resource(uid) do
-      {:ok, %{url: resource_url, ics: raw_ics}} ->
+      {:ok, %{url: resource_url, ics: raw_ics} = res} ->
+        dup_urls = Map.get(res, :duplicate_urls, [])
+
         case ICal.apply_recurring_edit(raw_ics, edit_scope, recurrence_id, enriched_attrs) do
           {:single_put, updated_ics, final_attendees} ->
             case CalDAV.put_raw_ics_to_url(resource_url, updated_ics) do
-              :ok -> {:ok, uid, final_attendees}
-              {:error, reason} -> {:error, reason}
+              :ok ->
+                CalDAV.delete_resource_urls(dup_urls)
+                {:ok, uid, final_attendees}
+
+              {:error, reason} ->
+                {:error, reason}
             end
 
           {:split_put, truncated_ics, new_uid, new_series_ics, final_attendees} ->
             with :ok <- CalDAV.put_raw_ics_to_url(resource_url, truncated_ics),
-                  {:ok, ^new_uid} <- CalDAV.put_raw_ics(new_uid, new_series_ics) do
+                 {:ok, ^new_uid} <- CalDAV.put_raw_ics(new_uid, new_series_ics) do
+              CalDAV.delete_resource_urls(dup_urls)
               {:ok, new_uid, final_attendees}
             end
         end
@@ -348,12 +355,17 @@ defmodule UkkoWeb.EventController do
 
   defp persist_event_save(uid, enriched_attrs, true, _edit_scope, _recurrence_id) do
     case CalDAV.get_event_resource(uid) do
-      {:ok, %{url: resource_url, ics: raw_ics}} ->
+      {:ok, %{url: resource_url, ics: raw_ics} = res} ->
+        dup_urls = Map.get(res, :duplicate_urls, [])
         {ics_payload, final_attendees} = ICal.prepare_single_event_update(raw_ics, enriched_attrs)
 
         case CalDAV.put_raw_ics_to_url(resource_url, ics_payload) do
-          :ok -> {:ok, uid, final_attendees}
-          {:error, reason} -> {:error, reason}
+          :ok ->
+            CalDAV.delete_resource_urls(dup_urls)
+            {:ok, uid, final_attendees}
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       _ ->
@@ -412,10 +424,19 @@ defmodule UkkoWeb.EventController do
 
   defp delete_recurring_occurrence(uid, scope, recurrence_id) do
     case CalDAV.get_event_resource(uid) do
-      {:ok, %{url: resource_url, ics: raw_ics}} ->
+      {:ok, %{url: resource_url, ics: raw_ics} = res} ->
+        dup_urls = Map.get(res, :duplicate_urls, [])
+
         case ICal.apply_recurring_delete(raw_ics, scope, recurrence_id) do
           {:single_put, updated_ics} ->
-            CalDAV.put_raw_ics_to_url(resource_url, updated_ics)
+            case CalDAV.put_raw_ics_to_url(resource_url, updated_ics) do
+              :ok ->
+                CalDAV.delete_resource_urls(dup_urls)
+                :ok
+
+              {:error, reason} ->
+                {:error, reason}
+            end
 
           :delete_all ->
             maybe_cancel_attached_zoom(uid)

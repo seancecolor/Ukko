@@ -336,8 +336,107 @@ defmodule Ukko.ICalTest do
 
     assert [%{email: "alex@example.com", status: "NEEDS-ACTION"}] = final_attendees
     assert updated_ics =~ "SEQUENCE:1"
+    assert updated_ics =~ "LAST-MODIFIED:"
     assert [parsed] = ICal.parse_vevents(updated_ics)
     assert [%{email: "alex@example.com", status: "NEEDS-ACTION"}] = parsed.attendees
+  end
+
+  test "subscribed .ics feed reflects edits, recurring deletes, UTF-8 lookups, and deduplicates stale files" do
+    # 1. Recurring single delete increments SEQUENCE and updates LAST-MODIFIED so subscribed calendars re-sync
+    series_ics =
+      ICal.build_ics(%{
+        uid: "feed-rec-1",
+        title: "Family Dinner",
+        start: "2026-11-12T02:00:00Z",
+        end: "2026-11-12T03:00:00Z",
+        timezone: "America/Los_Angeles",
+        rrule: "FREQ=WEEKLY;COUNT=3"
+      })
+
+    {:single_put, after_del_ics} =
+      ICal.apply_recurring_delete(series_ics, "single", "2026-11-19T02:00:00Z")
+
+    assert after_del_ics =~ "SEQUENCE:1"
+    assert after_del_ics =~ "LAST-MODIFIED:"
+    assert after_del_ics =~ "EXDATE;TZID=America/Los_Angeles:20261118T180000"
+
+    # 2. UTF-8 multistatus resource lookup works without crashing on emojis/accents
+    multistatus_with_utf8 = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+      <D:response>
+        <D:href>/dav/cal/visitantmedia%40thundermail.com/default/server-gen-99.ics</D:href>
+        <D:propstat>
+          <D:prop>
+            <C:calendar-data>BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VEVENT
+    UID:imported-uid@google.com
+    SEQUENCE:0
+    DTSTAMP:20261101T100000Z
+    LAST-MODIFIED:20261101T100000Z
+    DTSTART:20261125T180000Z
+    DTEND:20261125T190000Z
+    SUMMARY:📍 Old Coffee — Såulf
+    END:VEVENT
+    END:VCALENDAR</C:calendar-data>
+          </D:prop>
+        </D:propstat>
+      </D:response>
+      <D:response>
+        <D:href>/dav/cal/visitantmedia%40thundermail.com/default/imported-uid%40google.com.ics</D:href>
+        <D:propstat>
+          <D:prop>
+            <C:calendar-data>BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VEVENT
+    UID:imported-uid@google.com
+    SEQUENCE:2
+    DTSTAMP:20261120T120000Z
+    LAST-MODIFIED:20261120T120000Z
+    DTSTART:20261125T200000Z
+    DTEND:20261125T210000Z
+    SUMMARY:📍 Updated Coffee — Såulf
+    END:VEVENT
+    END:VCALENDAR</C:calendar-data>
+          </D:prop>
+        </D:propstat>
+      </D:response>
+      <D:response>
+        <D:href>/dav/cal/visitantmedia%40thundermail.com/default/cancelled-evt.ics</D:href>
+        <D:propstat>
+          <D:prop>
+            <C:calendar-data>BEGIN:VCALENDAR
+    VERSION:2.0
+    BEGIN:VEVENT
+    UID:cancelled-uid-1
+    STATUS:CANCELLED
+    DTSTART:20261126T180000Z
+    DTEND:20261126T190000Z
+    SUMMARY:Deleted Meeting
+    END:VEVENT
+    END:VCALENDAR</C:calendar-data>
+          </D:prop>
+        </D:propstat>
+      </D:response>
+    </D:multistatus>
+    """
+
+    matches =
+      CalDAV.extract_uid_resources_from_multistatus(
+        multistatus_with_utf8,
+        "https://mail.thundermail.com/dav/cal/visitantmedia%40thundermail.com/default/",
+        "imported-uid@google.com"
+      )
+
+    assert length(matches) == 2
+
+    combined_feed = CalDAV.build_combined_ics(multistatus_with_utf8)
+    assert combined_feed =~ "REFRESH-INTERVAL;VALUE=DURATION:PT15M"
+    assert combined_feed =~ "X-PUBLISHED-TTL:PT15M"
+    assert combined_feed =~ "SUMMARY:📍 Updated Coffee — Såulf"
+    refute combined_feed =~ "SUMMARY:📍 Old Coffee — Såulf"
+    refute combined_feed =~ "UID:cancelled-uid-1"
   end
 
   test "creates TZID recurring series across evening local time and deletes single occurrence via EXDATE" do

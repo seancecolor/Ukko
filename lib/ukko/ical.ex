@@ -1459,6 +1459,7 @@ defmodule Ukko.ICal do
     organizer_name = Map.get(attrs, :organizer_name) || ""
 
     dtstamp = iso8601_to_ical_utc(DateTime.utc_now())
+    created = non_empty_trimmed(Map.get(attrs, :created)) || dtstamp
     dtstart = format_dt_prop("DTSTART", start_iso, tzid, vtimezones)
     dtend = format_dt_prop("DTEND", end_iso || start_iso, tzid, vtimezones)
 
@@ -1493,7 +1494,10 @@ defmodule Ukko.ICal do
       [
         "BEGIN:VEVENT",
         "UID:#{uid}",
-        "DTSTAMP:#{dtstamp}"
+        "DTSTAMP:#{dtstamp}",
+        "CREATED:#{created}",
+        "LAST-MODIFIED:#{dtstamp}",
+        "STATUS:CONFIRMED"
       ] ++
         rec_id_lines ++
         sequence_lines ++
@@ -1565,6 +1569,7 @@ defmodule Ukko.ICal do
         existing_ev = parse_raw_vevent(first_inner, vtimezones)
         {existing_props, _, _, _} = extract_vevent_all_props(first_inner)
         next_seq = (parse_int(get_prop_raw(existing_props, "SEQUENCE"), 0) || 0) + 1
+        existing_created = non_empty_trimmed(get_prop_raw(existing_props, "CREATED"))
 
         {org_email, org_name} = resolve_organizer_meta(existing_ev, new_attrs)
 
@@ -1583,6 +1588,7 @@ defmodule Ukko.ICal do
           build_vevent_component(
             new_attrs
             |> Map.put(:sequence, next_seq)
+            |> Map.put(:created, existing_created)
             |> Map.put(:attendees, final_attendees)
             |> Map.put(:organizer_email, org_email)
             |> Map.put(:organizer_name, org_name)
@@ -1728,7 +1734,8 @@ defmodule Ukko.ICal do
                 end)
                 |> Enum.map(&("BEGIN:VEVENT\r\n" <> &1 <> "\r\nEND:VEVENT"))
 
-              master_wrapped = "BEGIN:VEVENT\r\n" <> master_block <> "\r\nEND:VEVENT"
+              refreshed_master = bump_vevent_revision(master_block, master_seq)
+              master_wrapped = "BEGIN:VEVENT\r\n" <> refreshed_master <> "\r\nEND:VEVENT"
               updated_ics = wrap_vcalendar(vt_blocks, [master_wrapped | kept_overrides] ++ [override_vevent])
               {:single_put, updated_ics, final_attendees}
 
@@ -1757,6 +1764,7 @@ defmodule Ukko.ICal do
                     |> Map.put(:uid, master_ev.uid)
                     |> Map.put(:rrule, adjusted_rrule)
                     |> Map.put(:sequence, master_seq + 1)
+                    |> Map.put(:created, non_empty_trimmed(get_prop_raw(master_props, "CREATED")))
                     |> Map.put(:attendees, final_attendees)
                     |> Map.put(:organizer_email, org_email)
                     |> Map.put(:organizer_name, org_name)
@@ -1767,7 +1775,11 @@ defmodule Ukko.ICal do
                 {:single_put, wrap_vcalendar(vt_blocks_following, [updated_master]), final_attendees}
               else
                 until_val = compute_until_before(master_ev.dtstart, target_rec_iso)
-                truncated_master_inner = replace_master_rrule_until(master_block, master_ev.rrule_raw, until_val)
+
+                truncated_master_inner =
+                  master_block
+                  |> replace_master_rrule_until(master_ev.rrule_raw, until_val)
+                  |> bump_vevent_revision(master_seq + 1)
 
                 kept_prior_overrides =
                   other_inners
@@ -1843,6 +1855,7 @@ defmodule Ukko.ICal do
       master_block ->
         master_ev = parse_raw_vevent(master_block, vtimezones)
         {master_props, _, _, _} = extract_vevent_all_props(master_block)
+        master_seq = parse_int(get_prop_raw(master_props, "SEQUENCE"), 0) || 0
         target_rec_iso = non_empty_trimmed(recurrence_id_iso)
 
         cond do
@@ -1853,7 +1866,9 @@ defmodule Ukko.ICal do
             exdate_line =
               build_exdate_line(Map.get(master_props, "DTSTART"), target_rec_iso, vtimezones)
 
-            master_with_exdate = master_block <> "\r\n" <> exdate_line
+            master_with_exdate =
+              (master_block <> "\r\n" <> exdate_line)
+              |> bump_vevent_revision(master_seq + 1)
 
             kept_overrides =
               other_inners
@@ -1875,7 +1890,11 @@ defmodule Ukko.ICal do
               :delete_all
             else
               until_val = compute_until_before(master_ev.dtstart, target_rec_iso)
-              truncated_master_inner = replace_master_rrule_until(master_block, master_ev.rrule_raw, until_val)
+
+              truncated_master_inner =
+                master_block
+                |> replace_master_rrule_until(master_ev.rrule_raw, until_val)
+                |> bump_vevent_revision(master_seq + 1)
 
               kept_prior_overrides =
                 other_inners
@@ -2403,6 +2422,52 @@ defmodule Ukko.ICal do
       end
     end)
     |> Enum.join("\r\n")
+  end
+
+  defp bump_vevent_revision(vevent_inner, next_seq)
+       when is_binary(vevent_inner) and is_integer(next_seq) do
+    now_utc = iso8601_to_ical_utc(DateTime.utc_now())
+
+    {cleaned_lines, _in_alarm} =
+      vevent_inner
+      |> :binary.split(["\r\n", "\n"], [:global, :trim_all])
+      |> Enum.reduce({[], false}, fn line, {acc, in_alarm} ->
+        trimmed = String.trim(line)
+
+        cond do
+          trimmed == "BEGIN:VALARM" ->
+            {[line | acc], true}
+
+          trimmed == "END:VALARM" ->
+            {[line | acc], false}
+
+          in_alarm ->
+            {[line | acc], true}
+
+          Regex.match?(~r/^(?:DTSTAMP|LAST-MODIFIED|SEQUENCE)(?:;[^:]*)?:/i, trimmed) ->
+            {acc, false}
+
+          true ->
+            {[line | acc], false}
+        end
+      end)
+
+    ordered = Enum.reverse(cleaned_lines)
+
+    revision_lines = [
+      "DTSTAMP:#{now_utc}",
+      "LAST-MODIFIED:#{now_utc}",
+      "SEQUENCE:#{next_seq}"
+    ]
+
+    case Enum.find_index(ordered, &Regex.match?(~r/^UID(?:;[^:]*)?:/i, String.trim(&1))) do
+      nil ->
+        Enum.join(revision_lines ++ ordered, "\r\n")
+
+      uid_idx ->
+        {head, tail} = Enum.split(ordered, uid_idx + 1)
+        Enum.join(head ++ revision_lines ++ tail, "\r\n")
+    end
   end
 
   defp adjust_rrule_for_following(

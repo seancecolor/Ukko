@@ -95,7 +95,7 @@
       : '';
 
   // App version state
-  let appVersion = '1.0.1';
+  let appVersion = '1.0.2';
 
   // Mobile detection & layout state (iPhone / Firefox iOS FxiOS / responsive viewport)
   function checkIsMobileEnv() {
