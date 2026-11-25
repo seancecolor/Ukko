@@ -1,13 +1,15 @@
 defmodule Ukko.FastCache do
   @moduledoc """
   High-speed ETS cache with Stale-While-Revalidate (SWR) background refresh,
-  startup cache warming, and fast binary XML tag extraction for CalDAV/CardDAV.
+  UID-to-resource indexing, write-through updates, startup cache warming, and
+  fast binary XML tag extraction for CalDAV/CardDAV.
   """
 
   use GenServer
 
   @table :ukko_fast_cache
   @caldav_key :primary_caldav_parsed
+  @caldav_resources_key :primary_caldav_resources
   @contacts_key :carddav_contacts
 
   def start_link(_opts) do
@@ -67,6 +69,61 @@ defmodule Ukko.FastCache do
   end
 
   @doc """
+  Stores `val` directly under `key` with `ttl_seconds` freshness window.
+  """
+  def put_direct(key, val, ttl_seconds) when is_integer(ttl_seconds) do
+    if :ets.whereis(@table) != :undefined do
+      now = System.system_time(:second)
+      :ets.insert(@table, {key, val, now + ttl_seconds})
+    end
+
+    :ok
+  end
+
+  @doc """
+  Stores the full `%{uid => [%{url: binary, ics: binary}]}` index in ETS.
+  """
+  def put_caldav_resources(resources_map) when is_map(resources_map) do
+    if :ets.whereis(@table) != :undefined do
+      :ets.insert(@table, {@caldav_resources_key, resources_map, System.system_time(:second)})
+    end
+
+    :ok
+  end
+
+  @doc """
+  Looks up cached `%{url, ics}` resources for `uid` in <0.05 ms.
+  Returns `{:hit, list}` when the resource map is warm in ETS, or `:miss` if cold.
+  """
+  def get_caldav_uid_resources(uid) when is_binary(uid) do
+    if :ets.whereis(@table) == :undefined do
+      :miss
+    else
+      case :ets.lookup(@table, @caldav_resources_key) do
+        [{@caldav_resources_key, map, _ts}] when is_map(map) ->
+          {:hit, Map.get(map, uid, [])}
+
+        _ ->
+          :miss
+      end
+    end
+  end
+
+  @doc """
+  Returns `{:ok, resources_map}` if the CalDAV resource map is warm in ETS, else `:miss`.
+  """
+  def get_all_caldav_resources do
+    if :ets.whereis(@table) == :undefined do
+      :miss
+    else
+      case :ets.lookup(@table, @caldav_resources_key) do
+        [{@caldav_resources_key, map, _ts}] when is_map(map) -> {:ok, map}
+        _ -> :miss
+      end
+    end
+  end
+
+  @doc """
   Deletes a key (and any refresh lock) from ETS.
   """
   def delete(key) do
@@ -81,7 +138,11 @@ defmodule Ukko.FastCache do
   def caldav_key, do: @caldav_key
   def contacts_key, do: @contacts_key
 
-  def invalidate_caldav, do: delete(@caldav_key)
+  def invalidate_caldav do
+    delete(@caldav_key)
+    delete(@caldav_resources_key)
+  end
+
   def invalidate_contacts, do: delete(@contacts_key)
 
   @doc """

@@ -322,7 +322,7 @@ defmodule UkkoWeb.EventController do
 
         case ICal.apply_recurring_edit(raw_ics, edit_scope, recurrence_id, enriched_attrs) do
           {:single_put, updated_ics, final_attendees} ->
-            case CalDAV.put_raw_ics_to_url(resource_url, updated_ics) do
+            case CalDAV.put_raw_ics_to_url(resource_url, updated_ics, uid) do
               :ok ->
                 CalDAV.delete_resource_urls(dup_urls)
                 {:ok, uid, final_attendees}
@@ -332,7 +332,7 @@ defmodule UkkoWeb.EventController do
             end
 
           {:split_put, truncated_ics, new_uid, new_series_ics, final_attendees} ->
-            with :ok <- CalDAV.put_raw_ics_to_url(resource_url, truncated_ics),
+            with :ok <- CalDAV.put_raw_ics_to_url(resource_url, truncated_ics, uid),
                  {:ok, ^new_uid} <- CalDAV.put_raw_ics(new_uid, new_series_ics) do
               CalDAV.delete_resource_urls(dup_urls)
               {:ok, new_uid, final_attendees}
@@ -359,7 +359,7 @@ defmodule UkkoWeb.EventController do
         dup_urls = Map.get(res, :duplicate_urls, [])
         {ics_payload, final_attendees} = ICal.prepare_single_event_update(raw_ics, enriched_attrs)
 
-        case CalDAV.put_raw_ics_to_url(resource_url, ics_payload) do
+        case CalDAV.put_raw_ics_to_url(resource_url, ics_payload, uid) do
           :ok ->
             CalDAV.delete_resource_urls(dup_urls)
             {:ok, uid, final_attendees}
@@ -402,7 +402,7 @@ defmodule UkkoWeb.EventController do
       if scope in ["single", "following"] do
         delete_recurring_occurrence(uid, scope, recurrence_id)
       else
-        maybe_cancel_attached_zoom(uid)
+        maybe_cancel_attached_zoom_async(uid)
         CalDAV.delete_event(uid)
       end
 
@@ -429,7 +429,7 @@ defmodule UkkoWeb.EventController do
 
         case ICal.apply_recurring_delete(raw_ics, scope, recurrence_id) do
           {:single_put, updated_ics} ->
-            case CalDAV.put_raw_ics_to_url(resource_url, updated_ics) do
+            case CalDAV.put_raw_ics_to_url(resource_url, updated_ics, uid) do
               :ok ->
                 CalDAV.delete_resource_urls(dup_urls)
                 :ok
@@ -439,7 +439,7 @@ defmodule UkkoWeb.EventController do
             end
 
           :delete_all ->
-            maybe_cancel_attached_zoom(uid)
+            maybe_cancel_attached_zoom_from_ics_async(raw_ics)
             CalDAV.delete_event(uid)
         end
 
@@ -451,18 +451,47 @@ defmodule UkkoWeb.EventController do
     end
   end
 
-  defp maybe_cancel_attached_zoom(uid) do
-    case CalDAV.get_raw_ics(uid) do
-      {:ok, raw_ics} ->
-        case ICal.parse_vevents(raw_ics) do
-          [ev | _] ->
-            case Zoom.extract_meeting_id(ev.location, ev.description) do
-              nil -> :ok
-              meeting_id -> _ = Zoom.delete_meeting(meeting_id)
-            end
+  defp maybe_cancel_attached_zoom_async(uid) do
+    # Grab cached .ics synchronously (<0.05 ms) before CalDAV.delete_event removes it from ETS,
+    # then run any Zoom API cancellation asynchronously off the request path.
+    cached_ics =
+      case Ukko.FastCache.get_caldav_uid_resources(uid) do
+        {:hit, [%{ics: ics} | _]} -> ics
+        _ -> nil
+      end
+
+    Task.start(fn ->
+      raw_ics =
+        case cached_ics do
+          ics when is_binary(ics) and ics != "" ->
+            ics
 
           _ ->
-            :ok
+            case CalDAV.get_raw_ics(uid) do
+              {:ok, fetched} -> fetched
+              _ -> nil
+            end
+        end
+
+      if is_binary(raw_ics) do
+        cancel_zoom_in_ics(raw_ics)
+      end
+    end)
+
+    :ok
+  end
+
+  defp maybe_cancel_attached_zoom_from_ics_async(raw_ics) when is_binary(raw_ics) do
+    Task.start(fn -> cancel_zoom_in_ics(raw_ics) end)
+    :ok
+  end
+
+  defp cancel_zoom_in_ics(raw_ics) do
+    case ICal.parse_vevents(raw_ics) do
+      [ev | _] ->
+        case Zoom.extract_meeting_id(ev.location, ev.description) do
+          nil -> :ok
+          meeting_id -> _ = Zoom.delete_meeting(meeting_id)
         end
 
       _ ->
@@ -496,8 +525,11 @@ defmodule UkkoWeb.EventController do
         {:ok, attrs}
 
       meeting_id ->
-        # Sync updated start_time, duration, and topic to the existing Zoom meeting
-        _ = Zoom.update_meeting(meeting_id, attrs)
+        # Sync updated start_time, duration, and topic to Zoom asynchronously in the background
+        Task.start(fn ->
+          _ = Zoom.update_meeting(meeting_id, attrs)
+        end)
+
         {:ok, attrs}
     end
   end

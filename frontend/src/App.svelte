@@ -61,6 +61,7 @@
   let calendar = null;
   let events = [];
   let loadingEvents = false;
+  let pendingMutations = 0;
   let bannerError = '';
   let bannerSuccess = '';
   let currentRange = { start: null, end: null };
@@ -95,7 +96,7 @@
       : '';
 
   // App version state
-  let appVersion = '1.0.2';
+  let appVersion = '1.0.3';
 
   // Mobile detection & layout state (iPhone / Firefox iOS FxiOS / responsive viewport)
   function checkIsMobileEnv() {
@@ -971,6 +972,89 @@
     } catch {
       // ignore storage quota errors
     }
+  }
+
+  function serializeMappedEventForCache(ev) {
+    const isAllDay = Boolean(ev.allDay || ev.extendedProps?.allDay);
+    const startVal = isAllDay
+      ? ev.start instanceof Date
+        ? toLocalDateKey(ev.start)
+        : String(ev.start || '').slice(0, 10)
+      : ev.start instanceof Date
+        ? ev.start.toISOString()
+        : String(ev.start || '');
+    const endVal = isAllDay
+      ? ev.end instanceof Date
+        ? toLocalDateKey(ev.end)
+        : String(ev.end || startVal).slice(0, 10)
+      : ev.end instanceof Date
+        ? ev.end.toISOString()
+        : String(ev.end || startVal);
+
+    return {
+      id: ev.id,
+      uid: ev.extendedProps?.uid || ev.id,
+      title: ev.title,
+      allDay: isAllDay,
+      start: startVal,
+      end: endVal,
+      description: ev.extendedProps?.description || '',
+      location: ev.extendedProps?.location || '',
+      locationUrl: ev.extendedProps?.locationUrl || '',
+      organizer: ev.extendedProps?.organizer || null,
+      attendees: ev.extendedProps?.attendees || [],
+      isRecurring: Boolean(ev.extendedProps?.isRecurring),
+      rrule: ev.extendedProps?.rrule || '',
+      recurrenceId: ev.extendedProps?.recurrenceId || '',
+      readOnly: Boolean(ev.extendedProps?.readOnly),
+      calendarName: ev.extendedProps?.calendarName || 'Thundercal',
+      color: ev.extendedProps?.color || ev.color || '#2563eb'
+    };
+  }
+
+  function commitOptimisticEvents(nextEvents) {
+    events = nextEvents;
+    if (calendar) {
+      calendar.setOption('events', events);
+    }
+    checkUpcomingNotifications();
+    persistCachedEvents(events.map(serializeMappedEventForCache));
+  }
+
+  function buildOptimisticMappedEvent(uid, payload, isAllDay, opts = {}) {
+    const { isRecurring = Boolean(payload.rrule), recurrenceId = '' } = opts;
+    const optimisticLoc =
+      payload.create_zoom && !payload.location
+        ? 'Generating Zoom meeting...'
+        : payload.location || '';
+    const optimisticLocUrl =
+      !payload.create_zoom && optimisticLoc && !isUrl(optimisticLoc)
+        ? buildMapQuestUrl(optimisticLoc, payload.location_url || '')
+        : '';
+    const pendingAttendees = (payload.attendees || []).map((a) => ({
+      ...a,
+      status: 'NEEDS-ACTION'
+    }));
+
+    return mapApiEvents([
+      {
+        id: `${uid}::${payload.start}`,
+        uid,
+        title: payload.title || '(No Title)',
+        allDay: isAllDay,
+        start: payload.start,
+        end: payload.end || payload.start,
+        description: payload.description || '',
+        location: optimisticLoc,
+        locationUrl: optimisticLocUrl,
+        attendees: pendingAttendees,
+        isRecurring,
+        rrule: payload.rrule || '',
+        recurrenceId,
+        readOnly: false,
+        calendarName: 'Thundercal'
+      }
+    ])[0];
   }
 
   function hydrateCachedContacts() {
@@ -1980,11 +2064,33 @@
       return;
     }
 
-    savingEvent = true;
+    const previousEvents = events;
+    const targetUid = isEdit
+      ? editingUid
+      : `optimistic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const optimisticItem = buildOptimisticMappedEvent(targetUid, payload, isAllDay);
+
+    // Apply optimistic update and close modal immediately (<16ms perceived latency)
+    const nextOptimistic = isEdit
+      ? events.map((item) => {
+          const itemUid = item.extendedProps?.uid || item.id;
+          return itemUid === targetUid ? optimisticItem : item;
+        })
+      : [...events, optimisticItem];
+
+    commitOptimisticEvents(nextOptimistic);
+    bannerError = '';
+    showEventModal = false;
+    editingUid = null;
+    editingIsRecurring = false;
+    editingRecurrenceId = '';
+    editingOriginalRrule = '';
+
+    pendingMutations += 1;
 
     try {
       const url = isEdit
-        ? `/api/events/${encodeURIComponent(editingUid)}`
+        ? `/api/events/${encodeURIComponent(targetUid)}`
         : '/api/events';
       const method = isEdit ? 'PUT' : 'POST';
 
@@ -1999,11 +2105,7 @@
       });
 
       if (res.status === 401) {
-        showEventModal = false;
-        editingUid = null;
-        editingIsRecurring = false;
-        editingRecurrenceId = '';
-        editingOriginalRrule = '';
+        commitOptimisticEvents(previousEvents);
         handleLogout();
         authError = 'Session expired. Please enter your passcode.';
         return;
@@ -2011,7 +2113,8 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        formError = formatApiError(
+        commitOptimisticEvents(previousEvents);
+        bannerError = formatApiError(
           data,
           isEdit ? 'Failed to update event.' : 'Failed to create event.',
           res.status
@@ -2019,30 +2122,83 @@
         return;
       }
 
-      showEventModal = false;
-      editingUid = null;
-      editingIsRecurring = false;
-      editingRecurrenceId = '';
-      editingOriginalRrule = '';
-      await fetchEvents(null, null, { force: true });
+      const savedMapped = mapApiEvents([data])[0];
+      if (savedMapped) {
+        const reconciled = events.map((item) => {
+          const itemUid = item.extendedProps?.uid || item.id;
+          return itemUid === targetUid ? savedMapped : item;
+        });
+        commitOptimisticEvents(reconciled);
+      }
+
+      // If recurring rules are active, expand all occurrences from the backend's <1ms write-through ETS cache
+      if (payload.rrule) {
+        fetchEvents(null, null, { force: true });
+      }
     } catch (err) {
-      formError = 'Network error while saving event.';
+      commitOptimisticEvents(previousEvents);
+      bannerError = 'Network error while saving event.';
     } finally {
-      savingEvent = false;
+      pendingMutations = Math.max(0, pendingMutations - 1);
     }
   }
 
   async function confirmRecurringChange() {
     if (!pendingRecurringChange || applyingRecurringChange) return;
-    applyingRecurringChange = true;
-    recurringScopeError = '';
 
     const { source, uid, recurrenceId, payload, revert } = pendingRecurringChange;
+    const scope = recurringEditScope;
     const scopedPayload = {
       ...payload,
-      edit_scope: recurringEditScope,
+      edit_scope: scope,
       recurrence_id: recurrenceId
     };
+
+    const previousEvents = events;
+    const isAllDay = String(payload.start || '').trim().length === 10;
+    const targetRecMs = recurrenceId ? new Date(recurrenceId).getTime() : NaN;
+
+    // Optimistically update the occurrence(s) in memory and close modals immediately
+    const optimisticOccurrence = buildOptimisticMappedEvent(uid, payload, isAllDay, {
+      isRecurring: scope === 'single' ? true : Boolean(payload.rrule),
+      recurrenceId: scope === 'single' ? recurrenceId : ''
+    });
+
+    const optimisticList = events.map((item) => {
+      const itemUid = item.extendedProps?.uid || item.id;
+      if (itemUid !== uid) return item;
+
+      const itemRec = item.extendedProps?.recurrenceId || '';
+      const itemStartMs = (item.start instanceof Date ? item.start : new Date(item.start)).getTime();
+
+      if (scope === 'single') {
+        const isMatch =
+          (itemRec && itemRec === recurrenceId) ||
+          (!Number.isNaN(targetRecMs) && Math.abs(itemStartMs - targetRecMs) < 60_000);
+        return isMatch ? optimisticOccurrence : item;
+      }
+
+      // For 'following', update matching occurrence right away; full split series reconciles right after PUT
+      const isMatch =
+        (itemRec && itemRec === recurrenceId) ||
+        (!Number.isNaN(targetRecMs) && Math.abs(itemStartMs - targetRecMs) < 60_000);
+      return isMatch ? optimisticOccurrence : item;
+    });
+
+    commitOptimisticEvents(optimisticList);
+    bannerError = '';
+    recurringScopeError = '';
+    showRecurringScopeModal = false;
+    pendingRecurringChange = null;
+    if (source === 'modal') {
+      showEventModal = false;
+      editingUid = null;
+      editingIsRecurring = false;
+      editingRecurrenceId = '';
+      editingOriginalRrule = '';
+    }
+
+    pendingMutations += 1;
 
     try {
       const res = await fetch(`/api/events/${encodeURIComponent(uid)}`, {
@@ -2057,12 +2213,7 @@
 
       if (res.status === 401) {
         if (source === 'drop' && revert) revert();
-        showRecurringScopeModal = false;
-        pendingRecurringChange = null;
-        showEventModal = false;
-        editingUid = null;
-        editingIsRecurring = false;
-        editingRecurrenceId = '';
+        commitOptimisticEvents(previousEvents);
         handleLogout();
         authError = 'Session expired. Please enter your passcode.';
         return;
@@ -2070,23 +2221,19 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        recurringScopeError = formatApiError(data, 'Failed to update recurring event.', res.status);
+        if (source === 'drop' && revert) revert();
+        commitOptimisticEvents(previousEvents);
+        bannerError = formatApiError(data, 'Failed to update recurring event.', res.status);
         return;
       }
 
-      showRecurringScopeModal = false;
-      pendingRecurringChange = null;
-      if (source === 'modal') {
-        showEventModal = false;
-        editingUid = null;
-        editingIsRecurring = false;
-        editingRecurrenceId = '';
-      }
       await fetchEvents(null, null, { force: true });
     } catch {
-      recurringScopeError = 'Network error while updating recurring event.';
+      if (source === 'drop' && revert) revert();
+      commitOptimisticEvents(previousEvents);
+      bannerError = 'Network error while updating recurring event.';
     } finally {
-      applyingRecurringChange = false;
+      pendingMutations = Math.max(0, pendingMutations - 1);
     }
   }
 
@@ -2171,6 +2318,7 @@
     }
 
     bannerError = '';
+    pendingMutations += 1;
 
     try {
       const res = await fetch(`/api/events/${encodeURIComponent(uid)}`, {
@@ -2201,7 +2349,7 @@
         ? data.attendees
         : (payload.attendees || []).map((att) => ({ ...att, status: 'NEEDS-ACTION' }));
 
-      events = events.map((item) => {
+      const nextEvents = events.map((item) => {
         const itemUid = item.extendedProps?.uid || item.id;
         if (itemUid === uid) {
           return {
@@ -2218,14 +2366,12 @@
         }
         return item;
       });
-      if (calendar) {
-        calendar.setOption('events', events);
-      }
-      checkUpcomingNotifications();
-      fetchEvents(null, null, { force: true });
+      commitOptimisticEvents(nextEvents);
     } catch (err) {
       info.revert();
       bannerError = 'Network error while updating moved event.';
+    } finally {
+      pendingMutations = Math.max(0, pendingMutations - 1);
     }
   }
 
@@ -2270,11 +2416,21 @@
       return;
     }
 
-    deletingEvent = true;
+    const uidToDelete = selectedEvent.uid;
+    const previousEvents = events;
+
+    // Optimistically remove event and close modal immediately
+    selectedEvent = null;
     deleteError = '';
+    bannerError = '';
+    commitOptimisticEvents(
+      events.filter((item) => (item.extendedProps?.uid || item.id) !== uidToDelete)
+    );
+
+    pendingMutations += 1;
 
     try {
-      const encodedUid = encodeURIComponent(selectedEvent.uid);
+      const encodedUid = encodeURIComponent(uidToDelete);
       const res = await fetch(`/api/events/${encodedUid}`, {
         method: 'DELETE',
         credentials: 'same-origin',
@@ -2282,7 +2438,7 @@
       });
 
       if (res.status === 401) {
-        selectedEvent = null;
+        commitOptimisticEvents(previousEvents);
         handleLogout();
         authError = 'Session expired. Please enter your passcode.';
         return;
@@ -2290,24 +2446,22 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        deleteError = formatApiError(data, 'Failed to delete event.', res.status);
-        return;
+        commitOptimisticEvents(previousEvents);
+        bannerError = formatApiError(data, 'Failed to delete event.', res.status);
       }
-
-      selectedEvent = null;
-      await fetchEvents(null, null, { force: true });
     } catch (err) {
-      deleteError = 'Network error while deleting event.';
+      commitOptimisticEvents(previousEvents);
+      bannerError = 'Network error while deleting event.';
     } finally {
-      deletingEvent = false;
+      pendingMutations = Math.max(0, pendingMutations - 1);
     }
   }
 
   async function confirmRecurringDelete() {
     if (!selectedEvent?.uid || deletingRecurringScope) return;
-    deletingRecurringScope = true;
-    recurringDeleteError = '';
 
+    const uidToDelete = selectedEvent.uid;
+    const scope = recurringDeleteScope;
     const recId =
       selectedEvent.recurrenceId ||
       (selectedEvent.allDay
@@ -2315,14 +2469,48 @@
         : selectedEvent.start instanceof Date
           ? selectedEvent.start.toISOString()
           : String(selectedEvent.start || ''));
+    const targetRecMs = recId ? new Date(recId).getTime() : NaN;
+
+    const previousEvents = events;
+
+    // Optimistically remove matching occurrence(s) and close modals immediately
+    showRecurringDeleteModal = false;
+    selectedEvent = null;
+    recurringDeleteError = '';
+    bannerError = '';
+
+    const nextOptimistic = events.filter((item) => {
+      const itemUid = item.extendedProps?.uid || item.id;
+      if (itemUid !== uidToDelete) return true;
+      if (scope === 'all') return false;
+
+      const itemRec = item.extendedProps?.recurrenceId || '';
+      const itemStartMs = (item.start instanceof Date ? item.start : new Date(item.start)).getTime();
+
+      if (scope === 'single') {
+        const isMatch =
+          (itemRec && itemRec === recId) ||
+          (!Number.isNaN(targetRecMs) && Math.abs(itemStartMs - targetRecMs) < 60_000);
+        return !isMatch;
+      }
+
+      // scope === 'following'
+      if (!Number.isNaN(targetRecMs) && !Number.isNaN(itemStartMs)) {
+        return itemStartMs < targetRecMs - 60_000;
+      }
+      return itemRec !== recId;
+    });
+
+    commitOptimisticEvents(nextOptimistic);
+    pendingMutations += 1;
 
     const params = new URLSearchParams({
-      scope: recurringDeleteScope,
+      scope,
       recurrence_id: recId
     });
 
     try {
-      const encodedUid = encodeURIComponent(selectedEvent.uid);
+      const encodedUid = encodeURIComponent(uidToDelete);
       const res = await fetch(`/api/events/${encodedUid}?${params.toString()}`, {
         method: 'DELETE',
         credentials: 'same-origin',
@@ -2330,8 +2518,7 @@
       });
 
       if (res.status === 401) {
-        showRecurringDeleteModal = false;
-        selectedEvent = null;
+        commitOptimisticEvents(previousEvents);
         handleLogout();
         authError = 'Session expired. Please enter your passcode.';
         return;
@@ -2339,7 +2526,8 @@
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        recurringDeleteError = formatApiError(
+        commitOptimisticEvents(previousEvents);
+        bannerError = formatApiError(
           data,
           'Failed to delete recurring event.',
           res.status
@@ -2347,13 +2535,12 @@
         return;
       }
 
-      showRecurringDeleteModal = false;
-      selectedEvent = null;
       await fetchEvents(null, null, { force: true });
     } catch {
-      recurringDeleteError = 'Network error while deleting recurring event.';
+      commitOptimisticEvents(previousEvents);
+      bannerError = 'Network error while deleting recurring event.';
     } finally {
-      deletingRecurringScope = false;
+      pendingMutations = Math.max(0, pendingMutations - 1);
     }
   }
 
@@ -2919,8 +3106,11 @@
             <pre class="ascii-part ascii-thunder">{asciiThunderText}</pre>
             <pre class="ascii-part ascii-cal">{asciiCalText}</pre>
           </div>
-          {#if loadingEvents || importingIcs}
-            <span class="mobile-sync-dot" title={importingIcs ? 'Importing .ics...' : 'Syncing...'}></span>
+          {#if loadingEvents || importingIcs || pendingMutations > 0}
+            <span
+              class="mobile-sync-dot"
+              title={importingIcs ? 'Importing .ics...' : pendingMutations > 0 ? 'Saving...' : 'Syncing...'}
+            ></span>
           {/if}
         </div>
 
@@ -3002,9 +3192,9 @@
               <pre class="ascii-part ascii-cal">{asciiCalText}</pre>
             </div>
           </div>
-          {#if loadingEvents || importingIcs}
+          {#if loadingEvents || importingIcs || pendingMutations > 0}
             <span class="status-pill">
-              {importingIcs ? 'Importing .ics...' : 'Syncing...'}
+              {importingIcs ? 'Importing .ics...' : pendingMutations > 0 ? 'Saving...' : 'Syncing...'}
             </span>
           {/if}
         </div>

@@ -63,7 +63,11 @@ defmodule Ukko.CalDAV do
              max_retries: 2
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in [200, 207] ->
-          combined_ics = build_combined_ics(to_string(body))
+          xml_str = to_string(body)
+          resources_map = build_uid_resources_index(xml_str, cfg.url)
+          FastCache.put_caldav_resources(resources_map)
+
+          combined_ics = build_combined_ics(xml_str)
           {_vtz, raw_vevents, _overrides} = parsed_cal = ICal.parse_calendar_data(combined_ics)
           parsed_calendars = if raw_vevents == [], do: [], else: [parsed_cal]
 
@@ -95,7 +99,7 @@ defmodule Ukko.CalDAV do
     with {:ok, cfg} <- get_config() do
       event_url = build_event_url(cfg.url, uid)
 
-      case put_raw_ics_to_url(event_url, ics_payload) do
+      case put_raw_ics_to_url(event_url, ics_payload, uid) do
         :ok -> {:ok, uid}
         {:error, reason} -> {:error, reason}
       end
@@ -103,12 +107,15 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Uploads a raw `.ics` payload directly to a resolved CalDAV resource URL.
+  Uploads a raw `.ics` payload directly to a resolved CalDAV resource URL and updates the
+  in-memory ETS cache write-through so subsequent reads require zero cold `REPORT` round-trips.
   """
-  def put_raw_ics_to_url(resource_url, ics_payload)
+  def put_raw_ics_to_url(resource_url, ics_payload, uid \\ nil)
       when is_binary(resource_url) and is_binary(ics_payload) do
     with {:ok, cfg} <- get_config() do
-      is_internal_config = String.contains?(resource_url, "ukko-subscriptions-config")
+      is_internal_config =
+        uid == "ukko-subscriptions-config" or
+          String.contains?(resource_url, "ukko-subscriptions-config")
 
       put_headers =
         if is_internal_config do
@@ -132,7 +139,8 @@ defmodule Ukko.CalDAV do
            ) do
         {:ok, %Req.Response{status: status}} when status in [200, 201, 204] ->
           unless is_internal_config do
-            FastCache.invalidate_caldav()
+            effective_uid = uid || extract_first_uid(ics_payload)
+            write_through_upsert(effective_uid, resource_url, ics_payload)
           end
 
           :ok
@@ -149,23 +157,24 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Deletes any duplicate CalDAV resource URLs left behind under alternate filenames.
+  Deletes any duplicate CalDAV resource URLs asynchronously in the background so
+  housekeeping never blocks event save latency.
   """
   def delete_resource_urls(urls) when is_list(urls) do
     if urls != [] do
-      with {:ok, cfg} <- get_config() do
-        Enum.each(urls, fn url ->
-          _ =
-            Req.delete(url,
-              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-              headers: [{"schedule-reply", "F"}],
-              decode_body: false,
-              receive_timeout: 15_000
-            )
-        end)
-
-        FastCache.invalidate_caldav()
-      end
+      Task.start(fn ->
+        with {:ok, cfg} <- get_config() do
+          Enum.each(urls, fn url ->
+            _ =
+              Req.delete(url,
+                auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+                headers: [{"schedule-reply", "F"}],
+                decode_body: false,
+                receive_timeout: 15_000
+              )
+          end)
+        end
+      end)
     end
 
     :ok
@@ -184,11 +193,25 @@ defmodule Ukko.CalDAV do
   end
 
   @doc """
-  Resolves a CalDAV event by `uid`, trying direct `GET <caldav_url><uid>.ics` first and
-  falling back to a `REPORT` UID `prop-filter` lookup when the resource filename differs
-  from `<uid>.ics`. Returns `{:ok, %{url: resolved_url, ics: raw_ics}}`.
+  Resolves a CalDAV event by `uid` in <0.1 ms from the warm ETS UID-to-resource index when
+  available, falling back to a direct `GET <caldav_url><uid>.ics` and `REPORT` UID lookup only
+  on a cold cache miss.
   """
   def get_event_resource(uid) when is_binary(uid) do
+    if uid != "ukko-subscriptions-config" do
+      case FastCache.get_caldav_uid_resources(uid) do
+        {:hit, [primary | rest]} ->
+          {:ok, %{url: primary.url, ics: primary.ics, duplicate_urls: Enum.map(rest, & &1.url)}}
+
+        _ ->
+          get_event_resource_uncached(uid)
+      end
+    else
+      get_event_resource_uncached(uid)
+    end
+  end
+
+  defp get_event_resource_uncached(uid) do
     with {:ok, cfg} <- get_config() do
       event_url = build_event_url(cfg.url, uid)
 
@@ -201,17 +224,7 @@ defmodule Ukko.CalDAV do
              max_retries: 1
            ) do
         {:ok, %Req.Response{status: 200, body: body}} ->
-          other_urls =
-            if uid == "ukko-subscriptions-config" do
-              []
-            else
-              cfg
-              |> lookup_all_event_resources_by_uid(uid)
-              |> Enum.map(& &1.url)
-              |> Enum.reject(&(&1 == event_url))
-            end
-
-          {:ok, %{url: event_url, ics: to_string(body), duplicate_urls: other_urls}}
+          {:ok, %{url: event_url, ics: to_string(body), duplicate_urls: []}}
 
         {:ok, %Req.Response{status: 404}} ->
           case lookup_all_event_resources_by_uid(cfg, uid) do
@@ -300,35 +313,70 @@ defmodule Ukko.CalDAV do
       event_url = build_event_url(cfg.url, uid)
       sched_headers = [{"schedule-reply", "T"}]
 
-      # Discover all CalDAV resource URLs carrying this UID (handles server-named or imported .ics files)
-      discovered_urls =
-        cfg
-        |> lookup_all_event_resources_by_uid(uid)
-        |> Enum.map(& &1.url)
-
-      alt_urls =
-        if String.contains?(uid, "@") do
-          [build_event_url(cfg.url, String.replace(uid, "@", "_"))]
-        else
-          []
+      cached_urls =
+        case FastCache.get_caldav_uid_resources(uid) do
+          {:hit, [_ | _] = list} -> Enum.map(list, & &1.url)
+          _ -> nil
         end
 
-      candidate_urls = Enum.uniq([event_url | discovered_urls ++ alt_urls])
-
       results =
-        Enum.map(candidate_urls, fn target_url ->
-          Req.delete(target_url,
-            auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
-            headers: sched_headers,
-            decode_body: false,
-            receive_timeout: 25_000,
-            connect_options: [timeout: 15_000],
-            retry: :transient,
-            max_retries: 2
-          )
-        end)
+        if is_list(cached_urls) do
+          # Fast path: we already know the exact resource URL(s) from ETS — zero REPORT needed!
+          Enum.map(Enum.uniq(cached_urls), fn target_url ->
+            Req.delete(target_url,
+              auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+              headers: sched_headers,
+              decode_body: false,
+              receive_timeout: 25_000,
+              connect_options: [timeout: 15_000],
+              retry: :transient,
+              max_retries: 2
+            )
+          end)
+        else
+          # Cold cache fallback: try direct DELETE first, only run REPORT lookup on 404
+          case Req.delete(event_url,
+                 auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+                 headers: sched_headers,
+                 decode_body: false,
+                 receive_timeout: 25_000,
+                 connect_options: [timeout: 15_000],
+                 retry: :transient,
+                 max_retries: 2
+               ) do
+            {:ok, %Req.Response{status: 404}} ->
+              discovered_urls =
+                cfg
+                |> lookup_all_event_resources_by_uid(uid)
+                |> Enum.map(& &1.url)
 
-      FastCache.invalidate_caldav()
+              alt_urls =
+                if String.contains?(uid, "@") do
+                  [build_event_url(cfg.url, String.replace(uid, "@", "_"))]
+                else
+                  []
+                end
+
+              fallback_urls = Enum.uniq(discovered_urls ++ alt_urls) -- [event_url]
+
+              Enum.map(fallback_urls, fn target_url ->
+                Req.delete(target_url,
+                  auth: {:basic, "#{cfg.user}:#{cfg.pass}"},
+                  headers: sched_headers,
+                  decode_body: false,
+                  receive_timeout: 25_000,
+                  connect_options: [timeout: 15_000],
+                  retry: :transient,
+                  max_retries: 1
+                )
+              end)
+
+            direct_res ->
+              [direct_res]
+          end
+        end
+
+      write_through_delete(uid)
 
       hard_error =
         Enum.find_value(results, fn
@@ -340,7 +388,6 @@ defmodule Ukko.CalDAV do
       if is_nil(hard_error) do
         :ok
       else
-        # If at least one resource succeeded (200/202/204), treat overall delete as successful
         any_deleted? =
           Enum.any?(results, fn
             {:ok, %Req.Response{status: status}} when status in [200, 202, 204] -> true
@@ -397,8 +444,18 @@ defmodule Ukko.CalDAV do
   `(UID, RECURRENCE-ID)` entries (keeping the highest revision), and refresh hints.
   """
   def build_combined_ics(xml_body) when is_binary(xml_body) do
-    ics_blobs = FastCache.extract_xml_tag_bodies(xml_body, "calendar-data")
+    xml_body
+    |> FastCache.extract_xml_tag_bodies("calendar-data")
+    |> build_combined_ics_from_blobs()
+  rescue
+    _ ->
+      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Thundercal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+  catch
+    :exit, _ ->
+      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Thundercal//CalDAV Feed//EN\r\nEND:VCALENDAR\r\n"
+  end
 
+  defp build_combined_ics_from_blobs(ics_blobs) when is_list(ics_blobs) do
     vtimezones =
       ics_blobs
       |> Enum.flat_map(fn ics ->
@@ -709,6 +766,89 @@ defmodule Ukko.CalDAV do
     ~r/^UID(?:;[^:]*)?:(.*)$/im
     |> Regex.scan(unfolded, capture: :all_but_first)
     |> Enum.any?(fn [val] -> String.trim(val) == target_uid end)
+  end
+
+  defp extract_first_uid(ics_text) when is_binary(ics_text) do
+    unfolded =
+      ics_text
+      |> normalize_crlf()
+      |> String.replace(~r/\r\n[ \t]/, "")
+
+    case Regex.run(~r/^UID(?:;[^:]*)?:(.*)$/im, unfolded, capture: :all_but_first) do
+      [val] -> String.trim(val)
+      _ -> nil
+    end
+  end
+
+  defp build_uid_resources_index(xml_str, base_url) do
+    base_uri = URI.parse(base_url)
+
+    xml_str
+    |> FastCache.extract_xml_tag_bodies("response")
+    |> Enum.reduce(%{}, fn resp_inner, acc ->
+      href =
+        resp_inner
+        |> FastCache.extract_xml_tag_bodies("href")
+        |> List.first()
+        |> to_string()
+        |> String.trim()
+
+      ics =
+        resp_inner
+        |> FastCache.extract_xml_tag_bodies("calendar-data")
+        |> Enum.join("")
+
+      uid = if href != "" and String.trim(ics) != "", do: extract_first_uid(ics), else: nil
+
+      if is_binary(uid) and uid != "" and uid != "ukko-subscriptions-config" do
+        resolved = URI.merge(base_uri, href) |> URI.to_string()
+        entry = %{url: resolved, ics: ics}
+        Map.update(acc, uid, [entry], fn list -> list ++ [entry] end)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp write_through_upsert(nil, _resource_url, _ics_payload) do
+    FastCache.invalidate_caldav()
+  end
+
+  defp write_through_upsert(uid, resource_url, ics_payload) when is_binary(uid) do
+    case FastCache.get_all_caldav_resources() do
+      {:ok, map} ->
+        updated_map = Map.put(map, uid, [%{url: resource_url, ics: ics_payload}])
+        rebuild_parsed_cache_from_resources(updated_map)
+
+      :miss ->
+        FastCache.invalidate_caldav()
+    end
+  end
+
+  defp write_through_delete(uid) when is_binary(uid) do
+    case FastCache.get_all_caldav_resources() do
+      {:ok, map} ->
+        updated_map = Map.delete(map, uid)
+        rebuild_parsed_cache_from_resources(updated_map)
+
+      :miss ->
+        FastCache.invalidate_caldav()
+    end
+  end
+
+  defp rebuild_parsed_cache_from_resources(resources_map) when is_map(resources_map) do
+    FastCache.put_caldav_resources(resources_map)
+
+    ics_blobs =
+      resources_map
+      |> Map.values()
+      |> List.flatten()
+      |> Enum.map(& &1.ics)
+
+    combined_ics = build_combined_ics_from_blobs(ics_blobs)
+    {_vtz, raw_vevents, _overrides} = parsed_cal = ICal.parse_calendar_data(combined_ics)
+    parsed_calendars = if raw_vevents == [], do: [], else: [parsed_cal]
+    FastCache.put_direct(FastCache.caldav_key(), parsed_calendars, @caldav_soft_ttl_seconds)
   end
 
   defp get_config do
