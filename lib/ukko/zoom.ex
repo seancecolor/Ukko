@@ -1,23 +1,30 @@
 defmodule Ukko.Zoom do
   @moduledoc """
-  Zoom Server-to-Server OAuth and Meeting creation client using `Req`.
+  Zoom Server-to-Server OAuth and Meeting creation/update/cancellation client using `Req`.
   """
 
+  require Logger
   alias Ukko.ZoomTokenCache
 
   @oauth_url "https://zoom.us/oauth/token"
   @meetings_url "https://api.zoom.us/v2/users/me/meetings"
   @meeting_base_url "https://api.zoom.us/v2/meetings"
+  @default_timezone "America/Los_Angeles"
 
   @doc """
   Creates a Zoom meeting and returns `{:ok, %{join_url: ..., id: ..., password: ...}}`.
   """
   def create_meeting(attrs) do
+    do_create_meeting(attrs, true)
+  end
+
+  defp do_create_meeting(attrs, allow_retry) do
     with {:ok, token} <- get_access_token() do
       topic = Map.get(attrs, :title) || "Meeting"
       description = Map.get(attrs, :description) || ""
       start_iso = Map.get(attrs, :start)
       end_iso = Map.get(attrs, :end)
+      tz = resolve_timezone(Map.get(attrs, :timezone))
 
       {start_time_utc, duration_minutes} = parse_time_and_duration(start_iso, end_iso)
 
@@ -26,7 +33,7 @@ defmodule Ukko.Zoom do
         type: 2,
         start_time: start_time_utc,
         duration: duration_minutes,
-        timezone: "UTC",
+        timezone: tz,
         agenda: String.slice(description, 0, 2000)
       }
 
@@ -42,6 +49,15 @@ defmodule Ukko.Zoom do
              password: body["password"]
            }}
 
+        {:ok, %Req.Response{status: status, body: body}}
+        when allow_retry and status in [400, 401, 403] ->
+          if token_or_scope_error?(status, body) do
+            ZoomTokenCache.clear()
+            do_create_meeting(attrs, false)
+          else
+            {:error, {:zoom_api_error, status, body}}
+          end
+
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, {:zoom_api_error, status, body}}
 
@@ -52,8 +68,9 @@ defmodule Ukko.Zoom do
   end
 
   @doc """
-  Updates an existing Zoom meeting's `topic`, `start_time`, and `duration` via
+  Updates an existing Zoom meeting's `topic`, `start_time`, `duration`, and `timezone` via
   `PATCH /v2/meetings/:meeting_id` when the attached calendar event is moved or edited.
+  Automatically clears the cached OAuth token and retries once if scopes were recently updated.
   """
   def update_meeting(meeting_id, attrs) when is_binary(meeting_id) or is_integer(meeting_id) do
     clean_id = meeting_id |> to_string() |> String.replace(~r/[^\d]/, "")
@@ -61,36 +78,53 @@ defmodule Ukko.Zoom do
     if clean_id == "" do
       {:error, :invalid_meeting_id}
     else
-      with {:ok, token} <- get_access_token() do
-        topic = Map.get(attrs, :title) || "Meeting"
-        start_iso = Map.get(attrs, :start)
-        end_iso = Map.get(attrs, :end)
+      do_update_meeting(clean_id, attrs, true)
+    end
+  end
 
-        {start_time_utc, duration_minutes} = parse_time_and_duration(start_iso, end_iso)
+  defp do_update_meeting(clean_id, attrs, allow_retry) do
+    with {:ok, token} <- get_access_token() do
+      topic = Map.get(attrs, :title) || "Meeting"
+      start_iso = Map.get(attrs, :start)
+      end_iso = Map.get(attrs, :end)
+      tz = resolve_timezone(Map.get(attrs, :timezone))
 
-        payload = %{
-          topic: topic,
-          type: 2,
-          start_time: start_time_utc,
-          duration: duration_minutes,
-          timezone: "UTC"
-        }
+      {start_time_utc, duration_minutes} = parse_time_and_duration(start_iso, end_iso)
 
-        url = "#{@meeting_base_url}/#{clean_id}"
+      payload = %{
+        topic: topic,
+        type: 2,
+        start_time: start_time_utc,
+        duration: duration_minutes,
+        timezone: tz
+      }
 
-        case Req.patch(url,
-               auth: {:bearer, token},
-               json: payload
-             ) do
-          {:ok, %Req.Response{status: status}} when status in [200, 204] ->
-            {:ok, clean_id}
+      url = "#{@meeting_base_url}/#{clean_id}"
 
-          {:ok, %Req.Response{status: status, body: body}} ->
+      case Req.patch(url,
+             auth: {:bearer, token},
+             json: payload
+           ) do
+        {:ok, %Req.Response{status: status}} when status in [200, 204] ->
+          {:ok, clean_id}
+
+        {:ok, %Req.Response{status: status, body: body}}
+        when allow_retry and status in [400, 401, 403] ->
+          if token_or_scope_error?(status, body) do
+            ZoomTokenCache.clear()
+            do_update_meeting(clean_id, attrs, false)
+          else
+            Logger.warning("Zoom PATCH /meetings/#{clean_id} failed (#{status}): #{inspect(body)}")
             {:error, {:zoom_api_error, status, body}}
+          end
 
-          {:error, exception} ->
-            {:error, exception}
-        end
+        {:ok, %Req.Response{status: status, body: body}} ->
+          Logger.warning("Zoom PATCH /meetings/#{clean_id} failed (#{status}): #{inspect(body)}")
+          {:error, {:zoom_api_error, status, body}}
+
+        {:error, exception} ->
+          Logger.warning("Zoom PATCH /meetings/#{clean_id} network error: #{inspect(exception)}")
+          {:error, exception}
       end
     end
   end
@@ -104,25 +138,74 @@ defmodule Ukko.Zoom do
     if clean_id == "" do
       {:error, :invalid_meeting_id}
     else
-      with {:ok, token} <- get_access_token() do
-        url = "#{@meeting_base_url}/#{clean_id}"
+      do_delete_meeting(clean_id, true)
+    end
+  end
 
-        case Req.delete(url,
-               auth: {:bearer, token},
-               params: [schedule_for_reminder: true]
-             ) do
-          {:ok, %Req.Response{status: status}} when status in [200, 204, 404] ->
-            :ok
+  defp do_delete_meeting(clean_id, allow_retry) do
+    with {:ok, token} <- get_access_token() do
+      url = "#{@meeting_base_url}/#{clean_id}"
 
-          {:ok, %Req.Response{status: status, body: body}} ->
+      case Req.delete(url,
+             auth: {:bearer, token},
+             params: [schedule_for_reminder: true]
+           ) do
+        {:ok, %Req.Response{status: status}} when status in [200, 204, 404] ->
+          :ok
+
+        {:ok, %Req.Response{status: status, body: body}}
+        when allow_retry and status in [400, 401, 403] ->
+          if token_or_scope_error?(status, body) do
+            ZoomTokenCache.clear()
+            do_delete_meeting(clean_id, false)
+          else
+            Logger.warning("Zoom DELETE /meetings/#{clean_id} failed (#{status}): #{inspect(body)}")
             {:error, {:zoom_api_error, status, body}}
+          end
 
-          {:error, exception} ->
-            {:error, exception}
-        end
+        {:ok, %Req.Response{status: status, body: body}} ->
+          Logger.warning("Zoom DELETE /meetings/#{clean_id} failed (#{status}): #{inspect(body)}")
+          {:error, {:zoom_api_error, status, body}}
+
+        {:error, exception} ->
+          {:error, exception}
       end
     end
   end
+
+  @doc """
+  Formats a Zoom API error into a clear user-facing explanation (especially missing OAuth scopes).
+  """
+  def format_error({:zoom_api_error, _status, %{"code" => 4711, "message" => msg}}) do
+    "Calendar event was moved, but Zoom rejected updating the meeting time (#{msg}). Enable the 'meeting:update:meeting:admin' (and 'meeting:delete:meeting:admin') scopes on your Zoom Server-to-Server OAuth app at marketplace.zoom.us."
+  end
+
+  def format_error({:zoom_api_error, status, %{"message" => msg}}) do
+    "Calendar event was saved, but Zoom returned HTTP #{status}: #{msg}"
+  end
+
+  def format_error({:zoom_api_error, status, body}) do
+    "Calendar event was saved, but Zoom returned HTTP #{status}: #{inspect(body)}"
+  end
+
+  def format_error(:missing_zoom_credentials) do
+    "Calendar event was saved, but Zoom credentials are not configured."
+  end
+
+  def format_error(other) do
+    "Calendar event was saved, but Zoom meeting sync failed: #{inspect(other)}"
+  end
+
+  defp token_or_scope_error?(401, _body), do: true
+  defp token_or_scope_error?(_status, %{"code" => code}) when code in [124, 4700, 4711], do: true
+  defp token_or_scope_error?(_, _), do: false
+
+  defp resolve_timezone(tz) when is_binary(tz) do
+    trimmed = String.trim(tz)
+    if trimmed == "" or String.upcase(trimmed) == "UTC", do: @default_timezone, else: trimmed
+  end
+
+  defp resolve_timezone(_), do: @default_timezone
 
   @doc """
   Extracts a Zoom numeric Meeting ID from an event's `location` or `description`

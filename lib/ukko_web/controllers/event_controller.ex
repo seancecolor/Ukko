@@ -261,15 +261,18 @@ defmodule UkkoWeb.EventController do
       is_update = success_status == :ok
       sync_zoom_on_update = is_update and edit_scope != "single"
 
-      with {:ok, enriched_attrs} <- maybe_sync_zoom(base_attrs, create_zoom, sync_zoom_on_update),
+      with {:ok, enriched_attrs, zoom_update_task} <-
+             prepare_zoom_for_save(base_attrs, create_zoom, sync_zoom_on_update),
            {:ok, saved_uid, final_attendees} <-
              persist_event_save(uid, enriched_attrs, is_update, edit_scope, recurrence_id) do
+        zoom_warning = await_zoom_update_warning(zoom_update_task)
+
         is_rec =
           is_binary(enriched_attrs[:rrule]) and String.trim(enriched_attrs[:rrule]) != "" and
             edit_scope != "single"
 
         event_response = %{
-          id: saved_uid,
+          id: "#{saved_uid}::#{enriched_attrs.start}",
           uid: saved_uid,
           title: enriched_attrs.title,
           start: enriched_attrs.start,
@@ -280,6 +283,7 @@ defmodule UkkoWeb.EventController do
           isRecurring: is_rec,
           rrule: enriched_attrs[:rrule] || "",
           attendees: final_attendees,
+          zoomWarning: zoom_warning,
           extendedProps: %{
             uid: saved_uid,
             description: enriched_attrs.description,
@@ -501,7 +505,7 @@ defmodule UkkoWeb.EventController do
     _ -> :ok
   end
 
-  defp maybe_sync_zoom(attrs, true, _is_update) do
+  defp prepare_zoom_for_save(attrs, true, _sync_existing) do
     case Zoom.create_meeting(attrs) do
       {:ok, %{join_url: join_url} = meeting} ->
         updated_description = Zoom.append_meeting_details(attrs.description, meeting)
@@ -512,29 +516,59 @@ defmodule UkkoWeb.EventController do
            | location: join_url || attrs.location,
              location_url: nil,
              description: updated_description
-         }}
+         }, nil}
 
       {:error, reason} ->
         {:error, {:zoom_error, reason}}
     end
   end
 
-  defp maybe_sync_zoom(attrs, false, true) do
-    case Zoom.extract_meeting_id(attrs.location, attrs.description) do
+  defp prepare_zoom_for_save(attrs, false, true) do
+    meeting_id = resolve_zoom_meeting_id_for_update(attrs)
+
+    case meeting_id do
       nil ->
-        {:ok, attrs}
+        {:ok, attrs, nil}
 
-      meeting_id ->
-        # Sync updated start_time, duration, and topic to Zoom asynchronously in the background
-        Task.start(fn ->
-          _ = Zoom.update_meeting(meeting_id, attrs)
-        end)
-
-        {:ok, attrs}
+      id ->
+        # Run Zoom PATCH concurrently alongside CalDAV PUT so there is no sequential latency penalty,
+        # while still capturing any scope/API error so the user gets immediate feedback.
+        task = Task.async(fn -> Zoom.update_meeting(id, attrs) end)
+        {:ok, attrs, task}
     end
   end
 
-  defp maybe_sync_zoom(attrs, false, false), do: {:ok, attrs}
+  defp prepare_zoom_for_save(attrs, false, false), do: {:ok, attrs, nil}
+
+  defp resolve_zoom_meeting_id_for_update(attrs) do
+    case Zoom.extract_meeting_id(attrs.location, attrs.description) do
+      id when is_binary(id) and id != "" ->
+        id
+
+      _ ->
+        # Fallback: check cached .ics in ETS in case location/description in drag payload omitted it
+        case Ukko.FastCache.get_caldav_uid_resources(attrs.uid) do
+          {:hit, [%{ics: cached_ics} | _]} ->
+            case ICal.parse_vevents(cached_ics) do
+              [ev | _] -> Zoom.extract_meeting_id(ev.location, ev.description)
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  defp await_zoom_update_warning(nil), do: nil
+
+  defp await_zoom_update_warning(%Task{} = task) do
+    case Task.yield(task, 5_000) || Task.shutdown(task) do
+      {:ok, {:ok, _}} -> nil
+      {:ok, {:error, reason}} -> Zoom.format_error(reason)
+      _ -> nil
+    end
+  end
 
   defp format_reason(:missing_caldav_credentials) do
     "Missing THUNDERMAIL_CALDAV_URL, THUNDERMAIL_USER, or THUNDERMAIL_PASS environment variable."

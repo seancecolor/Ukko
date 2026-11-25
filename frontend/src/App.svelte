@@ -96,7 +96,7 @@
       : '';
 
   // App version state
-  let appVersion = '1.0.3';
+  let appVersion = '1.0.4';
 
   // Mobile detection & layout state (iPhone / Firefox iOS FxiOS / responsive viewport)
   function checkIsMobileEnv() {
@@ -1022,7 +1022,7 @@
   }
 
   function buildOptimisticMappedEvent(uid, payload, isAllDay, opts = {}) {
-    const { isRecurring = Boolean(payload.rrule), recurrenceId = '' } = opts;
+    const { isRecurring = Boolean(payload.rrule), recurrenceId = '', pendingSave = false } = opts;
     const optimisticLoc =
       payload.create_zoom && !payload.location
         ? 'Generating Zoom meeting...'
@@ -1036,7 +1036,7 @@
       status: 'NEEDS-ACTION'
     }));
 
-    return mapApiEvents([
+    const mapped = mapApiEvents([
       {
         id: `${uid}::${payload.start}`,
         uid,
@@ -1055,6 +1055,14 @@
         calendarName: 'Thundercal'
       }
     ])[0];
+
+    if (pendingSave && (String(uid).startsWith('optimistic-') || payload.create_zoom)) {
+      mapped.editable = false;
+      mapped.startEditable = false;
+      mapped.durationEditable = false;
+    }
+
+    return mapped;
   }
 
   function hydrateCachedContacts() {
@@ -2068,7 +2076,9 @@
     const targetUid = isEdit
       ? editingUid
       : `optimistic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const optimisticItem = buildOptimisticMappedEvent(targetUid, payload, isAllDay);
+    const optimisticItem = buildOptimisticMappedEvent(targetUid, payload, isAllDay, {
+      pendingSave: true
+    });
 
     // Apply optimistic update and close modal immediately (<16ms perceived latency)
     const nextOptimistic = isEdit
@@ -2129,6 +2139,10 @@
           return itemUid === targetUid ? savedMapped : item;
         });
         commitOptimisticEvents(reconciled);
+      }
+
+      if (data.zoomWarning) {
+        bannerError = data.zoomWarning;
       }
 
       // If recurring rules are active, expand all occurrences from the backend's <1ms write-through ETS cache
@@ -2225,6 +2239,10 @@
         commitOptimisticEvents(previousEvents);
         bannerError = formatApiError(data, 'Failed to update recurring event.', res.status);
         return;
+      }
+
+      if (data.zoomWarning) {
+        bannerError = data.zoomWarning;
       }
 
       await fetchEvents(null, null, { force: true });
@@ -2343,6 +2361,10 @@
         info.revert();
         bannerError = formatApiError(data, 'Failed to update moved event.', res.status);
         return;
+      }
+
+      if (data.zoomWarning) {
+        bannerError = data.zoomWarning;
       }
 
       const updatedAttendees = Array.isArray(data.attendees)
